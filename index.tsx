@@ -59,10 +59,11 @@ const App: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
-  // Memoized AI client — avoids recreating on every translation call
+  // Memoized AI client — null when no key provided (avoids throwing on init)
+  const effectiveApiKey = userApiKey || import.meta.env.VITE_GEMINI_API_KEY || '';
   const aiClient = useMemo(
-    () => new GoogleGenAI({ apiKey: userApiKey || import.meta.env.VITE_GEMINI_API_KEY || '' }),
-    [userApiKey]
+    () => effectiveApiKey ? new GoogleGenAI({ apiKey: effectiveApiKey }) : null,
+    [effectiveApiKey]
   );
 
   useEffect(() => {
@@ -316,6 +317,12 @@ const App: React.FC = () => {
   const translateImage = async (img: ImageAsset, targetLang: string) => {
     try {
       setTranslatingImages(prev => ({ ...prev, [img.id]: true }));
+
+      if (!aiClient) {
+        triggerToast('No API key set. Open Settings to add your Gemini API key.');
+        return;
+      }
+
       triggerToast(`Translating image text to ${targetLang}...`);
 
       const { data: base64Data, mimeType } = await urlToBase64(img.originalUrl);
@@ -568,6 +575,9 @@ const App: React.FC = () => {
     });
 
     try {
+      if (!aiClient) {
+        throw new Error('No API key. Please open Settings and add your Gemini API key.');
+      }
       const stream = await aiClient.models.generateContentStream({
         model: 'gemini-2.0-flash',
         contents: `SYSTEM: You are a strict HTML Localization Engine and Elite Copywriter.

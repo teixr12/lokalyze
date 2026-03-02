@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo, useCallback, lazy, Suspense } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback, lazy, Suspense, Component } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import JSZip from 'jszip';
@@ -8,8 +8,8 @@ import { User } from 'firebase/auth';
 import { auth, signInWithPopup, googleProvider, signOut, onAuthStateChanged, isConfigured as isFirebaseConfigured } from './src/firebase';
 
 // Modular Imports
-import { LANGUAGES, MAX_CONCURRENT_JOBS, KEYS, DB_CONFIG } from './src/constants';
-import { dbHelper } from './src/db';
+import { LANGUAGES, MAX_CONCURRENT_JOBS, KEYS } from './src/constants';
+import { hybridDb } from './src/db';
 import type { TranslationJob, ImageAsset, IframeAsset, Project } from './src/types';
 import { Analytics, generateId, cleanStreamedHtml, formatDuration, formatDate, safeAssetId, urlToBase64 } from './src/utils';
 import { useDebounce } from './src/hooks';
@@ -18,6 +18,32 @@ import Icons from './src/components/Icons';
 import { LokalyzeLogo, ApxlbsLogo } from './src/components/Logo';
 import Tooltip from './src/components/Tooltip';
 import SettingsModal from './src/components/SettingsModal';
+
+// --- ERROR BOUNDARY ---
+interface ErrorBoundaryState { hasError: boolean; error: Error | null; }
+class ErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBoundaryState> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error: Error) { return { hasError: true, error }; }
+  componentDidCatch(error: Error, info: React.ErrorInfo) { console.error('[Lokalyze] Uncaught error:', error, info); }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ minHeight: '100vh', background: '#050505', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem' }}>
+          <div style={{ maxWidth: 480, textAlign: 'center', color: '#fff', fontFamily: 'system-ui' }}>
+            <div style={{ fontSize: '2rem', marginBottom: '1rem' }}>⚠️</div>
+            <h1 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: '0.5rem' }}>Something went wrong</h1>
+            <p style={{ color: '#888', fontSize: '0.85rem', marginBottom: '1.5rem' }}>{this.state.error?.message}</p>
+            <button onClick={() => window.location.reload()} style={{ background: '#7c3aed', color: '#fff', border: 'none', borderRadius: 8, padding: '0.75rem 1.5rem', cursor: 'pointer', fontWeight: 700 }}>Reload App</button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // --- APP COMPONENT ---
 const App: React.FC = () => {
@@ -135,10 +161,12 @@ const App: React.FC = () => {
     } catch (e) { }
   }, []);
 
-  // LOAD HISTORY FROM IDB ON MOUNT
+  // LOAD HISTORY ON MOUNT (cloud if logged in, local otherwise)
   useEffect(() => {
-    dbHelper.getAll().then(setHistory);
-  }, []);
+    if (!authLoading) {
+      hybridDb.getAll(user?.uid).then(setHistory);
+    }
+  }, [authLoading, user]);
 
   // SAVE ACTIVE PROJECT GRANULARLY (Debounced — avoids writing on every streaming progress tick)
   useEffect(() => {
@@ -146,11 +174,11 @@ const App: React.FC = () => {
     const timer = setTimeout(() => {
       const projectToSave = history.find(h => h.id === activeProjectId);
       if (projectToSave) {
-        dbHelper.save(projectToSave);
+        hybridDb.save(projectToSave, user?.uid);
       }
     }, 2000);
     return () => clearTimeout(timer);
-  }, [history, activeProjectId]);
+  }, [history, activeProjectId, user]);
 
   // Sync Active Jobs to History in real-time
   useEffect(() => {
@@ -293,7 +321,7 @@ const App: React.FC = () => {
       const { data: base64Data, mimeType } = await urlToBase64(img.originalUrl);
 
       const response = await aiClient.models.generateContent({
-        model: 'gemini-2.5-flash-image',
+        model: 'gemini-2.0-flash',
         contents: {
           parts: [
             {
@@ -380,8 +408,8 @@ const App: React.FC = () => {
     if (confirm("Are you sure you want to delete this project history?")) {
       setHistory(prev => prev.filter(p => p.id !== id));
       if (activeProjectId === id) setActiveProjectId(null);
-      // Delete from DB
-      dbHelper.delete(id).then(() => triggerToast("Project deleted"));
+      // Delete from hybrid DB (local + cloud)
+      hybridDb.delete(id, user?.uid).then(() => triggerToast("Project deleted"));
     }
   };
 
@@ -541,7 +569,7 @@ const App: React.FC = () => {
 
     try {
       const stream = await aiClient.models.generateContentStream({
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-2.0-flash',
         contents: `SYSTEM: You are a strict HTML Localization Engine and Elite Copywriter.
 TASK: Translate the text content of the provided HTML into ${lang}.
 
@@ -671,8 +699,8 @@ ${preprocessedSource}`,
     setActiveProjectId(newProjectId);
     setJobs(newJobs);
 
-    // Explicit save of new project
-    dbHelper.save(newProject);
+    // Explicit save of new project (hybrid: local + cloud)
+    hybridDb.save(newProject, user?.uid);
     Analytics.track('batch_started', { count: selectedLangs.length, projectId: newProjectId });
   };
 
@@ -1363,11 +1391,11 @@ ${preprocessedSource}`,
 
 const rootElement = document.getElementById('root');
 if (rootElement && !(window as any)._lokalyzeRoot) {
-  try {
-    const root = createRoot(rootElement);
-    (window as any)._lokalyzeRoot = root;
-    root.render(<App />);
-  } catch (err) {
-    console.error("LOKALYZE: Failed to mount app", err);
-  }
+  const root = createRoot(rootElement);
+  (window as any)._lokalyzeRoot = root;
+  root.render(
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
 }

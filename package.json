@@ -11,8 +11,9 @@
   "dependencies": {
     "@google/genai": "^1.34.0",
     "@monaco-editor/react": "^4.7.0",
+    "@supabase/supabase-js": "^2.98.0",
     "file-saver": "2.0.5",
-    "firebase": "^12.10.0",
+    "firebase": "^11.10.0",
     "jszip": "3.10.1",
     "react": "^19.2.3",
     "react-dom": "^19.2.3"

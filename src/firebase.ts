@@ -15,12 +15,17 @@ const firebaseConfig = {
 // Initialize Firebase only if config is provided
 const isConfigured = !!firebaseConfig.apiKey;
 
-const app = isConfigured 
-  ? (getApps().length === 0 ? initializeApp(firebaseConfig) : getApp()) 
+const app = isConfigured
+  ? (getApps().length === 0 ? initializeApp(firebaseConfig) : getApp())
   : null;
 
 const auth = app ? getAuth(app) : null;
-const analytics = app && typeof window !== 'undefined' ? getAnalytics(app) : null;
+
+// Only init analytics if measurementId is present (avoids crash when absent)
+const analytics = (app && firebaseConfig.measurementId && typeof window !== 'undefined')
+  ? getAnalytics(app)
+  : null;
+
 const googleProvider = new GoogleAuthProvider();
 
 export { auth, googleProvider, signInWithPopup, signOut, onAuthStateChanged, isConfigured, analytics };

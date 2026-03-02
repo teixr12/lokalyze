@@ -1,5 +1,6 @@
 import { DB_CONFIG } from './constants';
 import type { Project } from './types';
+import { cloudHelper, isSupabaseConfigured } from './supabase';
 
 // --- DATABASE ADAPTER (INDEXED DB) ---
 export const dbHelper = {
@@ -59,4 +60,30 @@ export const dbHelper = {
             tx.onerror = () => { db.close(); reject(tx.error); };
         });
     }
+};
+
+// --- HYBRID DB ADAPTER ---
+// When user is logged in + Supabase is configured → use cloud storage
+// Otherwise → fall back to IndexedDB (local only)
+export const hybridDb = {
+    getAll: async (userId?: string | null): Promise<Project[]> => {
+        if (isSupabaseConfigured && userId) {
+            return cloudHelper.getAll(userId);
+        }
+        return dbHelper.getAll();
+    },
+    save: async (project: Project, userId?: string | null): Promise<void> => {
+        // Always save to IndexedDB for offline support
+        await dbHelper.save(project);
+        // Also save to cloud if logged in
+        if (isSupabaseConfigured && userId) {
+            await cloudHelper.save(project, userId);
+        }
+    },
+    delete: async (id: string, userId?: string | null): Promise<void> => {
+        await dbHelper.delete(id);
+        if (isSupabaseConfigured && userId) {
+            await cloudHelper.delete(id, userId);
+        }
+    },
 };

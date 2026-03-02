@@ -39,4 +39,5 @@ export interface Project {
     detectedIframes?: IframeAsset[];
     jobs: Record<string, TranslationJob>;
     selectedLangs: string[];
+    userId?: string; // Set when synced to Supabase cloud storage
 }

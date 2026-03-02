@@ -1,6 +1,6 @@
 // --- UTILS ---
 
-export const generateId = () => Math.random().toString(36).substr(2, 9);
+export const generateId = () => Math.random().toString(36).substring(2, 11);
 
 export const cleanStreamedHtml = (text: string) => text.replace(/```html\n?|```/g, '').trim();
 
@@ -44,12 +44,12 @@ export const urlToBase64 = async (url: string): Promise<{ data: string, mimeType
 
 // --- ANALYTICS ADAPTER ---
 export const Analytics = {
-    track: (event: string, props: Record<string, any> = {}) => {
+    track: (event: string, props: Record<string, unknown> = {}) => {
         if (import.meta.env.DEV) {
             console.debug(`[Analytics] ${event}`, props);
         }
     },
-    identify: (userId: string) => {
+    identify: (_userId: string) => {
         // posthog.identify(userId)
     }
 };

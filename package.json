@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "smoke:prod": "bash scripts/smoke-prod.sh",
+    "smoke:local": "BASE_URL=http://127.0.0.1:4173 bash scripts/smoke-prod.sh",
+    "release:checklist": "cat docs/release-checklist.md",
+    "test:smoke": "playwright test tests/smoke.spec.ts"
   },
   "dependencies": {
     "@google/genai": "^1.34.0",
@@ -25,6 +29,7 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.0.0",
+    "@playwright/test": "^1.55.0",
     "tailwindcss": "^4.2.1",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"

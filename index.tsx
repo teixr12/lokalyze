@@ -35,7 +35,15 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBounda
     this.state = { hasError: false, error: null };
   }
   static getDerivedStateFromError(error: Error) { return { hasError: true, error }; }
-  componentDidCatch(error: Error, info: React.ErrorInfo) { console.error('[Lokalyze] Uncaught error:', error, info); }
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    Analytics.track('client_error', {
+      source: 'error_boundary',
+      message: error.message,
+      stack: error.stack,
+      componentStack: info.componentStack,
+    });
+    console.error('[Lokalyze] Uncaught error:', error, info);
+  }
   render() {
     if (this.state.hasError) {
       return (
@@ -85,6 +93,47 @@ const App: React.FC = () => {
     } else {
       setAuthLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
+    if (!user?.uid) return;
+    Analytics.identify(user.uid, {
+      email: user.email || '',
+      source: 'firebase_auth',
+    });
+  }, [user?.uid, user?.email]);
+
+  useEffect(() => {
+    const onGlobalError = (event: ErrorEvent) => {
+      Analytics.track('client_error', {
+        source: 'window.onerror',
+        message: event.message || 'Unknown global error',
+        filename: event.filename || '',
+        lineno: event.lineno || 0,
+        colno: event.colno || 0,
+      });
+    };
+
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason instanceof Error
+        ? event.reason.message
+        : typeof event.reason === 'string'
+          ? event.reason
+          : JSON.stringify(event.reason || {});
+
+      Analytics.track('client_error', {
+        source: 'unhandledrejection',
+        message: reason,
+      });
+    };
+
+    window.addEventListener('error', onGlobalError);
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
+
+    return () => {
+      window.removeEventListener('error', onGlobalError);
+      window.removeEventListener('unhandledrejection', onUnhandledRejection);
+    };
   }, []);
 
   const handleLogin = async () => {
@@ -327,6 +376,18 @@ const App: React.FC = () => {
     return import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY ? 'Cloud Sync' : 'Local + Auth';
   }, [user]);
   const jobsList = useMemo(() => Object.values(jobs) as TranslationJob[], [jobs]);
+  const activeProject = useMemo(
+    () => (activeProjectId ? history.find(h => h.id === activeProjectId) || null : null),
+    [history, activeProjectId]
+  );
+  const imageOverrideCount = useMemo(
+    () => detectedImages.filter(i => i.replacementUrl.trim().length > 0).length,
+    [detectedImages]
+  );
+  const totalAssetsDetected = useMemo(
+    () => detectedImages.length + detectedIframes.length,
+    [detectedImages.length, detectedIframes.length]
+  );
 
   const playNotificationSound = useCallback((type: 'success' | 'click') => {
     if (!soundEnabled) return;
@@ -486,7 +547,15 @@ const App: React.FC = () => {
       setHistory(prev => prev.filter(p => p.id !== id));
       if (activeProjectId === id) setActiveProjectId(null);
       // Delete from hybrid DB (local + cloud)
-      hybridDb.delete(id, user?.uid).then(() => triggerToast("Project deleted", 'success'));
+      hybridDb.delete(id, user?.uid)
+        .then(() => triggerToast("Project deleted", 'success'))
+        .catch((error) => {
+          Analytics.track('history_delete_failed', {
+            projectId: id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          triggerToast("Failed to delete project", 'error');
+        });
     }
   };
 
@@ -512,6 +581,11 @@ const App: React.FC = () => {
       triggerToast("Download complete", 'success');
     } catch (e) {
       console.warn("Direct download failed, opening in new tab", e);
+      Analytics.track('asset_download_failed', {
+        source: 'downloadAsset',
+        url,
+        error: e instanceof Error ? e.message : String(e),
+      });
       // Fallback: Open in new tab
       window.open(url, '_blank');
       triggerToast("Opened in new tab (CORS restricted)", 'warning');
@@ -578,6 +652,10 @@ const App: React.FC = () => {
 
     } catch (e: any) {
       console.error(e);
+      Analytics.track('asset_download_failed', {
+        source: 'downloadAllAssets',
+        error: e?.message || String(e),
+      });
       triggerToast(e.message || "Batch download failed", 'error');
     } finally {
       setIsDownloadingAssets(false);
@@ -1063,9 +1141,9 @@ ${preprocessedSource}`,
                   <Icons.Image />
                   <span>Assets Detected: {detectedImages.length}</span>
                 </div>
-                {detectedImages.filter(i => i.replacementUrl).length > 0 && (
+                {imageOverrideCount > 0 && (
                   <span className="text-[9px] font-bold text-emerald-500 bg-emerald-500/10 px-2 py-0.5 rounded-full">
-                    {detectedImages.filter(i => i.replacementUrl).length} Overrides
+                    {imageOverrideCount} Overrides
                   </span>
                 )}
               </div>
@@ -1090,7 +1168,7 @@ ${preprocessedSource}`,
               <Icons.Cpu /> Live Monitor
             </button>
             <button onClick={() => setActiveTab('assets')} className={`px-6 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all flex items-center gap-2 whitespace-nowrap ${activeTab === 'assets' ? 'bg-white dark:bg-[#0e0e0e] border-zinc-200 dark:border-white/10 text-violet-500 shadow-xl' : 'border-transparent text-zinc-400 hover:text-zinc-600 hover:bg-white/50 dark:hover:bg-white/5'}`}>
-              <Icons.Image /> Asset Manager <span className="ml-1 bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 px-1.5 py-0.5 rounded-md text-[9px]">{detectedImages.length + detectedIframes.length}</span>
+              <Icons.Image /> Asset Manager <span className="ml-1 bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 px-1.5 py-0.5 rounded-md text-[9px]">{totalAssetsDetected}</span>
             </button>
             <button onClick={() => setActiveTab('history')} className={`px-6 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all flex items-center gap-2 whitespace-nowrap ${activeTab === 'history' ? 'bg-white dark:bg-[#0e0e0e] border-zinc-200 dark:border-white/10 text-violet-500 shadow-xl' : 'border-transparent text-zinc-400 hover:text-zinc-600 hover:bg-white/50 dark:hover:bg-white/5'}`}>
               <Icons.History /> History <span className="ml-1 bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 px-1.5 py-0.5 rounded-md text-[9px]">{history.length}</span>
@@ -1111,7 +1189,7 @@ ${preprocessedSource}`,
                           <Badge tone="info">{monitorDensity === 'compact' ? 'Compact' : 'Comfortable'}</Badge>
                         ) : null}
                       </div>
-                      {activeProjectId && <span className="text-[9px] font-bold text-violet-500 mt-0.5 truncate max-w-[200px]">{history.find(h => h.id === activeProjectId)?.name}</span>}
+                      {activeProjectId && <span className="text-[9px] font-bold text-violet-500 mt-0.5 truncate max-w-[200px]">{activeProject?.name}</span>}
                       {uiFlags.monitor ? (
                         <div className="flex flex-wrap gap-1 pt-1">
                           <span className={cn("rounded-md px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider", statusVariantStyles.queued)}>Queued</span>

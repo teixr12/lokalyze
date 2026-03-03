@@ -1,3 +1,5 @@
+import type { AnalyticsEventName } from './analyticsTypes';
+
 // --- UTILS ---
 
 export const generateId = () => Math.random().toString(36).substring(2, 11);
@@ -43,13 +45,64 @@ export const urlToBase64 = async (url: string): Promise<{ data: string, mimeType
 };
 
 // --- ANALYTICS ADAPTER ---
+const EVENT_REQUIRED_KEYS: Partial<Record<AnalyticsEventName, string[]>> = {
+    asset_updated: ['assetId'],
+    iframe_updated: ['iframeId', 'type'],
+    job_started: ['jobId', 'lang'],
+    job_completed: ['jobId', 'lang'],
+    job_failed: ['jobId', 'lang', 'error'],
+    batch_started: ['projectId'],
+    asset_download_failed: ['source', 'error'],
+    history_delete_failed: ['projectId', 'error'],
+    client_error: ['source', 'message'],
+    release_smoke_passed: ['url'],
+    release_smoke_failed: ['url', 'error'],
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const validateEventProps = (event: string, props: Record<string, unknown>): string[] => {
+    const required = EVENT_REQUIRED_KEYS[event as AnalyticsEventName] || [];
+    return required.filter(key => props[key] === undefined || props[key] === null || props[key] === '');
+};
+
 export const Analytics = {
     track: (event: string, props: Record<string, unknown> = {}) => {
+        const eventName = typeof event === 'string' && event.trim().length > 0 ? event.trim() : 'unknown_event';
+        const safeProps = isRecord(props) ? props : {};
+        const missingKeys = validateEventProps(eventName, safeProps);
+
+        if (import.meta.env.DEV && missingKeys.length > 0) {
+            console.warn(`[Analytics] ${eventName} missing props`, missingKeys);
+        }
+
+        try {
+            const hook = (window as any).__lokalyzeAnalytics;
+            if (hook?.track) {
+                hook.track(eventName, safeProps);
+            }
+        } catch {
+            // Fail-safe analytics: never break UI flow.
+        }
+
         if (import.meta.env.DEV) {
-            console.debug(`[Analytics] ${event}`, props);
+            console.debug(`[Analytics] ${eventName}`, safeProps);
         }
     },
-    identify: (_userId: string) => {
-        // posthog.identify(userId)
+    identify: (userId: string, traits: Record<string, unknown> = {}) => {
+        if (!userId) return;
+        try {
+            const hook = (window as any).__lokalyzeAnalytics;
+            if (hook?.identify) {
+                hook.identify(userId, traits);
+            }
+        } catch {
+            // Fail-safe analytics: never break UI flow.
+        }
+
+        if (import.meta.env.DEV) {
+            console.debug('[Analytics] identify', { userId, ...traits });
+        }
     }
 };

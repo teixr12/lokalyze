@@ -38,8 +38,8 @@ cp .env.example .env
 | `VITE_FIREBASE_MESSAGING_SENDER_ID` | ✅ | Firebase sender ID |
 | `VITE_FIREBASE_APP_ID` | ✅ | Firebase app ID |
 | `VITE_FIREBASE_MEASUREMENT_ID` | ⬜ | Optional: Firebase Analytics |
-| `VITE_SUPABASE_URL` | ✅ | Your Supabase project URL |
-| `VITE_SUPABASE_ANON_KEY` | ✅ | Your Supabase anon/public key |
+| `VITE_SUPABASE_URL` | ⬜ | Optional: required only for cloud sync |
+| `VITE_SUPABASE_ANON_KEY` | ⬜ | Optional: required only for cloud sync |
 | `VITE_GEMINI_API_KEY` | ⬜ | Optional default Gemini key (users can also enter their own in Settings) |
 
 ### 3. Supabase Setup
@@ -71,7 +71,16 @@ create policy "Users manage own projects"
   with check (user_id = current_setting('app.current_user_id', true));
 ```
 
-> **Note**: The app uses Firebase Auth (not Supabase Auth). `user_id` is set to Firebase's `user.uid`.
+> **Important (Firebase Auth + Supabase Anon Key):** the policy above will block requests unless you inject `app.current_user_id` server-side.
+> This app runs directly in the browser and does not inject that value today.
+>
+> For current app behavior (Firebase-only frontend), use:
+>
+> ```sql
+> alter table projects disable row level security;
+> ```
+>
+> If you need strict per-user security, add a trusted backend/Edge Function that validates Firebase ID tokens and proxies or signs Supabase requests.
 
 ### 4. Run Dev Server
 

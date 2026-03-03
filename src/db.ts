@@ -2,6 +2,35 @@ import { DB_CONFIG } from './constants';
 import type { Project } from './types';
 import { cloudHelper, isSupabaseConfigured } from './supabase';
 
+const mergeProjectsByLatest = (local: Project[], cloud: Project[]): Project[] => {
+    const byId = new Map<string, Project>();
+    [...local, ...cloud].forEach(project => {
+        const existing = byId.get(project.id);
+        if (!existing || project.lastModified > existing.lastModified) {
+            byId.set(project.id, project);
+        }
+    });
+    return Array.from(byId.values()).sort((a, b) => b.createdAt - a.createdAt);
+};
+
+const syncLocalToCloudInBackground = async (
+    localProjects: Project[],
+    cloudProjects: Project[],
+    userId: string
+): Promise<void> => {
+    const cloudById = new Map(cloudProjects.map(project => [project.id, project]));
+    const syncTasks = localProjects
+        .filter(local => {
+            const cloud = cloudById.get(local.id);
+            return !cloud || local.lastModified > cloud.lastModified;
+        })
+        .map(local => cloudHelper.save(local, userId));
+
+    if (syncTasks.length === 0) return;
+
+    await Promise.all(syncTasks);
+};
+
 // --- DATABASE ADAPTER (INDEXED DB) ---
 export const dbHelper = {
     open: () => {
@@ -67,10 +96,19 @@ export const dbHelper = {
 // Otherwise → fall back to IndexedDB (local only)
 export const hybridDb = {
     getAll: async (userId?: string | null): Promise<Project[]> => {
+        const localProjects = await dbHelper.getAll();
+
         if (isSupabaseConfigured && userId) {
-            return cloudHelper.getAll(userId);
+            const cloudProjects = await cloudHelper.getAll(userId);
+            const mergedProjects = mergeProjectsByLatest(localProjects, cloudProjects);
+
+            // Best-effort cloud backfill for projects created offline.
+            void syncLocalToCloudInBackground(localProjects, cloudProjects, userId);
+
+            return mergedProjects;
         }
-        return dbHelper.getAll();
+
+        return localProjects;
     },
     save: async (project: Project, userId?: string | null): Promise<void> => {
         // Always save to IndexedDB for offline support

@@ -1,0 +1,42 @@
+name: deploy-hygiene
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 3 * * *'
+
+jobs:
+  prune-production:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERCEL_SCOPE: teixr12s-projects
+      VERCEL_PROJECT: lokalyze-maynfrme
+      KEEP_COUNT: 2
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Vercel CLI
+        run: npm i -g vercel@50
+
+      - name: Prune old production deployments
+        run: |
+          bash scripts/vercel-prune-lokalyze.sh | tee /tmp/prune-summary.txt
+
+      - name: Publish summary
+        if: always()
+        run: |
+          echo "## Deploy hygiene summary" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /tmp/prune-summary.txt ]; then
+            cat /tmp/prune-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No summary generated." >> "$GITHUB_STEP_SUMMARY"
+          fi

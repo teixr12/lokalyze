@@ -12,8 +12,17 @@ const firebaseConfig = {
   measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
 
-// Initialize Firebase only if config is provided
-const isConfigured = !!firebaseConfig.apiKey;
+const toBool = (value: string | undefined): boolean => {
+  if (!value) return false;
+  return value === '1' || value.toLowerCase() === 'true';
+};
+
+// Optional test-only override used by smoke workspace profile.
+const disableFirebaseAuth = toBool(import.meta.env.VITE_DISABLE_FIREBASE_AUTH);
+const hasFirebaseConfig = !!firebaseConfig.apiKey;
+
+// Initialize Firebase only if config is provided and auth isn't explicitly disabled.
+const isConfigured = hasFirebaseConfig && !disableFirebaseAuth;
 
 const app = isConfigured
   ? (getApps().length === 0 ? initializeApp(firebaseConfig) : getApp())

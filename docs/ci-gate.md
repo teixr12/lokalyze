@@ -8,6 +8,7 @@ The `quality-gate` workflow is required for `main` and includes:
 - perf guardrail (`npm run perf:budget`) inside `build_and_types`
 
 Any failed job blocks release until fixed or formally waived according to policy.
+Branch protection is configured with `strict=true` and `enforce_admins=true`.
 
 ## Local Reproduction
 Run in this order:

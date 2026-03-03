@@ -64,6 +64,7 @@ const EVENT_REQUIRED_KEYS: Partial<Record<AnalyticsEventName, string[]>> = {
     tab_switch_latency: ['panel', 'ms'],
     api_error: ['source', 'error'],
     latency_bucket: ['source', 'bucket'],
+    projects_shadow_drift: ['provider', 'shadow', 'drift'],
     asset_download_failed: ['source', 'error'],
     history_delete_failed: ['projectId', 'error'],
     client_error: ['source', 'message'],

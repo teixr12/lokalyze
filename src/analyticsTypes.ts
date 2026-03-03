@@ -19,6 +19,7 @@ export type AnalyticsEventName =
     | 'tab_switch_latency'
     | 'api_error'
     | 'latency_bucket'
+    | 'projects_shadow_drift'
     | 'asset_download_failed'
     | 'history_delete_failed'
     | 'client_error'

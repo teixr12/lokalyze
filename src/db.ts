@@ -1,6 +1,15 @@
 import { DB_CONFIG } from './constants';
 import type { Project } from './types';
 import { cloudHelper, isSupabaseConfigured } from './supabase';
+import { auth } from './firebase';
+import { Analytics } from './utils';
+import {
+    canFallbackToClientProvider,
+    getDataProviderMode,
+    getProxyProjectsUrl,
+    isProxyShadowReadEnabled,
+} from './dataProvider';
+import type { ProjectApiEnvelope, ProxySaveProjectPayload } from './apiTypes';
 
 const mergeProjectsByLatest = (local: Project[], cloud: Project[]): Project[] => {
     const byId = new Map<string, Project>();
@@ -16,7 +25,8 @@ const mergeProjectsByLatest = (local: Project[], cloud: Project[]): Project[] =>
 const syncLocalToCloudInBackground = async (
     localProjects: Project[],
     cloudProjects: Project[],
-    userId: string
+    userId: string,
+    cloudSave: (project: Project, userId: string) => Promise<void>
 ): Promise<void> => {
     const cloudById = new Map(cloudProjects.map(project => [project.id, project]));
     const syncTasks = localProjects
@@ -24,12 +34,101 @@ const syncLocalToCloudInBackground = async (
             const cloud = cloudById.get(local.id);
             return !cloud || local.lastModified > cloud.lastModified;
         })
-        .map(local => cloudHelper.save(local, userId));
+        .map(local => cloudSave(local, userId));
 
     if (syncTasks.length === 0) return;
 
     await Promise.all(syncTasks);
 };
+
+const requestTimeoutMs = 8000;
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs = requestTimeoutMs): Promise<T> => {
+    let timeoutId: number | undefined;
+    const timeoutPromise = new Promise<T>((_, reject) => {
+        timeoutId = window.setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
+    });
+
+    try {
+        return await Promise.race([promise, timeoutPromise]);
+    } finally {
+        if (timeoutId) window.clearTimeout(timeoutId);
+    }
+};
+
+const getCurrentIdToken = async (): Promise<string> => {
+    const currentUser = auth?.currentUser;
+    if (!currentUser) throw new Error('No authenticated user available for proxy request');
+    return currentUser.getIdToken();
+};
+
+const parseProxyEnvelope = async <T>(response: Response): Promise<ProjectApiEnvelope<T>> => {
+    let payload: unknown = null;
+    try {
+        payload = await response.json();
+    } catch {
+        // no-op
+    }
+
+    if (!response.ok) {
+        const errorMessage = (payload as { error?: string } | null)?.error || `Proxy request failed (${response.status})`;
+        throw new Error(errorMessage);
+    }
+
+    if (!payload || typeof payload !== 'object' || !('data' in payload)) {
+        throw new Error('Invalid proxy response envelope');
+    }
+
+    return payload as ProjectApiEnvelope<T>;
+};
+
+const proxyHelper = {
+    getAll: async (userId: string): Promise<Project[]> => {
+        if (!userId) return [];
+        const token = await getCurrentIdToken();
+        const response = await withTimeout(fetch(getProxyProjectsUrl(), {
+            headers: {
+                Authorization: `Bearer ${token}`,
+            },
+        }));
+        const envelope = await parseProxyEnvelope<Project[]>(response);
+        return envelope.data || [];
+    },
+    save: async (project: Project, userId: string): Promise<void> => {
+        if (!userId) return;
+        const token = await getCurrentIdToken();
+        const payload: ProxySaveProjectPayload = { project };
+        const response = await withTimeout(fetch(`${getProxyProjectsUrl()}/${project.id}`, {
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify(payload),
+        }));
+        await parseProxyEnvelope<Project>(response);
+    },
+    delete: async (id: string, userId: string): Promise<void> => {
+        if (!userId) return;
+        const token = await getCurrentIdToken();
+        const response = await withTimeout(fetch(`${getProxyProjectsUrl()}/${id}`, {
+            method: 'DELETE',
+            headers: {
+                Authorization: `Bearer ${token}`,
+            },
+        }));
+        await parseProxyEnvelope<{ deleted: boolean }>(response);
+    },
+};
+
+const trackProxyError = (action: string, error: unknown) => {
+    Analytics.track('api_error', {
+        source: `proxy_projects_${action}`,
+        error: error instanceof Error ? error.message : String(error),
+    });
+};
+
+const shouldUseProxyProvider = (): boolean => getDataProviderMode() === 'proxy';
 
 // --- DATABASE ADAPTER (INDEXED DB) ---
 export const dbHelper = {
@@ -99,12 +198,44 @@ export const hybridDb = {
         const localProjects = await dbHelper.getAll();
 
         if (isSupabaseConfigured && userId) {
+            if (shouldUseProxyProvider()) {
+                try {
+                    const proxyProjects = await proxyHelper.getAll(userId);
+                    const mergedProjects = mergeProjectsByLatest(localProjects, proxyProjects);
+
+                    void syncLocalToCloudInBackground(localProjects, proxyProjects, userId, proxyHelper.save);
+
+                    if (isProxyShadowReadEnabled()) {
+                        void cloudHelper.getAll(userId)
+                            .then((clientProjects) => {
+                                const drift = Math.abs(clientProjects.length - proxyProjects.length);
+                                if (drift > 0) {
+                                    Analytics.track('projects_shadow_drift', {
+                                        provider: 'proxy',
+                                        shadow: 'client',
+                                        drift,
+                                        proxyCount: proxyProjects.length,
+                                        clientCount: clientProjects.length,
+                                    });
+                                }
+                            })
+                            .catch(() => {
+                                // Shadow read must never block primary path.
+                            });
+                    }
+
+                    return mergedProjects;
+                } catch (error) {
+                    trackProxyError('getAll', error);
+                    if (!canFallbackToClientProvider()) {
+                        return localProjects;
+                    }
+                }
+            }
+
             const cloudProjects = await cloudHelper.getAll(userId);
             const mergedProjects = mergeProjectsByLatest(localProjects, cloudProjects);
-
-            // Best-effort cloud backfill for projects created offline.
-            void syncLocalToCloudInBackground(localProjects, cloudProjects, userId);
-
+            void syncLocalToCloudInBackground(localProjects, cloudProjects, userId, cloudHelper.save);
             return mergedProjects;
         }
 
@@ -115,12 +246,30 @@ export const hybridDb = {
         await dbHelper.save(project);
         // Also save to cloud if logged in
         if (isSupabaseConfigured && userId) {
+            if (shouldUseProxyProvider()) {
+                try {
+                    await proxyHelper.save(project, userId);
+                    return;
+                } catch (error) {
+                    trackProxyError('save', error);
+                    if (!canFallbackToClientProvider()) return;
+                }
+            }
             await cloudHelper.save(project, userId);
         }
     },
     delete: async (id: string, userId?: string | null): Promise<void> => {
         await dbHelper.delete(id);
         if (isSupabaseConfigured && userId) {
+            if (shouldUseProxyProvider()) {
+                try {
+                    await proxyHelper.delete(id, userId);
+                    return;
+                } catch (error) {
+                    trackProxyError('delete', error);
+                    if (!canFallbackToClientProvider()) return;
+                }
+            }
             await cloudHelper.delete(id, userId);
         }
     },

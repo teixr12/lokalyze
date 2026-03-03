@@ -10,6 +10,47 @@ export const supabase = isSupabaseConfigured
     ? createClient(supabaseUrl, supabaseAnonKey)
     : null;
 
+export interface SupabaseProjectRow {
+    id: string;
+    user_id: string;
+    name: string;
+    created_at: number;
+    last_modified: number;
+    source_html: string;
+    global_css: string;
+    detected_images: unknown[];
+    detected_iframes: unknown[];
+    jobs: Record<string, unknown>;
+    selected_langs: string[];
+}
+
+export const projectFromSupabaseRow = (row: Partial<SupabaseProjectRow>): Project => ({
+    id: row.id || '',
+    name: row.name || 'Untitled',
+    createdAt: row.created_at || Date.now(),
+    lastModified: row.last_modified || Date.now(),
+    sourceHtml: row.source_html || '',
+    globalCss: row.global_css || '',
+    detectedImages: (row.detected_images || []) as Project['detectedImages'],
+    detectedIframes: (row.detected_iframes || []) as Project['detectedIframes'],
+    jobs: (row.jobs || {}) as Project['jobs'],
+    selectedLangs: (row.selected_langs || []) as string[],
+});
+
+export const projectToSupabaseRow = (project: Project, userId: string): SupabaseProjectRow => ({
+    id: project.id,
+    user_id: userId,
+    name: project.name,
+    created_at: project.createdAt,
+    last_modified: project.lastModified,
+    source_html: project.sourceHtml,
+    global_css: project.globalCss,
+    detected_images: project.detectedImages,
+    detected_iframes: project.detectedIframes || [],
+    jobs: project.jobs as Record<string, unknown>,
+    selected_langs: project.selectedLangs,
+});
+
 // --- CLOUD DB ADAPTER (SUPABASE) ---
 export const cloudHelper = {
     getAll: async (userId: string): Promise<Project[]> => {
@@ -21,19 +62,8 @@ export const cloudHelper = {
                 .eq('user_id', userId)
                 .order('created_at', { ascending: false });
             if (error) throw error;
-            // Map snake_case columns back to camelCase
-            return (data || []).map(row => ({
-                id: row.id,
-                name: row.name,
-                createdAt: row.created_at,
-                lastModified: row.last_modified,
-                sourceHtml: row.source_html,
-                globalCss: row.global_css,
-                detectedImages: row.detected_images || [],
-                detectedIframes: row.detected_iframes || [],
-                jobs: row.jobs || {},
-                selectedLangs: row.selected_langs || [],
-            })) as Project[];
+            // Map snake_case columns back to camelCase.
+            return (data || []).map(projectFromSupabaseRow);
         } catch (e) {
             console.error('[Supabase] getAll failed', e);
             return [];
@@ -43,19 +73,7 @@ export const cloudHelper = {
     save: async (project: Project, userId: string): Promise<void> => {
         if (!supabase || !userId) return;
         try {
-            const { error } = await supabase.from('projects').upsert({
-                id: project.id,
-                user_id: userId,
-                name: project.name,
-                created_at: project.createdAt,
-                last_modified: project.lastModified,
-                source_html: project.sourceHtml,
-                global_css: project.globalCss,
-                detected_images: project.detectedImages,
-                detected_iframes: project.detectedIframes || [],
-                jobs: project.jobs,
-                selected_langs: project.selectedLangs,
-            });
+            const { error } = await supabase.from('projects').upsert(projectToSupabaseRow(project, userId));
             if (error) throw error;
         } catch (e) {
             console.error('[Supabase] save failed', e);

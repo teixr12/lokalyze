@@ -11,13 +11,21 @@ import { auth, signInWithPopup, googleProvider, signOut, onAuthStateChanged, isC
 import { LANGUAGES, MAX_CONCURRENT_JOBS, KEYS } from './src/constants';
 import { hybridDb } from './src/db';
 import type { TranslationJob, ImageAsset, IframeAsset, Project } from './src/types';
+import type { ToastMessage, ToastVariant } from './src/uiTypes';
 import { Analytics, generateId, cleanStreamedHtml, formatDuration, formatDate, safeAssetId, urlToBase64 } from './src/utils';
 import { useDebounce } from './src/hooks';
+import { resolveUiFlags } from './src/featureFlags';
 
 import Icons from './src/components/Icons';
 import { LokalyzeLogo, ApxlbsLogo } from './src/components/Logo';
 import Tooltip from './src/components/Tooltip';
 import SettingsModal from './src/components/SettingsModal';
+import { toastVariantStyles, cn, statusVariantStyles } from './src/design-system/primitives';
+import { Badge } from './src/design-system/components/Badge';
+import { EmptyState } from './src/design-system/components/EmptyState';
+import { InlineMessage } from './src/design-system/components/InlineMessage';
+import { Button } from './src/design-system/components/Button';
+import { Skeleton } from './src/design-system/components/Skeleton';
 
 // --- ERROR BOUNDARY ---
 interface ErrorBoundaryState { hasError: boolean; error: Error | null; }
@@ -58,6 +66,7 @@ const App: React.FC = () => {
   const [userApiKey, setUserApiKey] = useState(() => localStorage.getItem('lokalyze_api_key') || '');
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const uiFlags = useMemo(() => resolveUiFlags(user?.uid), [user?.uid]);
 
   // Memoized AI client — null when no key provided (avoids throwing on init)
   const effectiveApiKey = userApiKey || import.meta.env.VITE_GEMINI_API_KEY || '';
@@ -79,11 +88,11 @@ const App: React.FC = () => {
   }, []);
 
   const handleLogin = async () => {
-    if (!auth) return triggerToast("Firebase is not configured. Check .env.example");
+    if (!auth) return triggerToast("Firebase is not configured. Check .env.example", 'warning');
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error: any) {
-      triggerToast(`Login failed: ${error.message}`);
+      triggerToast(`Login failed: ${error.message}`, 'error');
     }
   };
 
@@ -96,7 +105,7 @@ const App: React.FC = () => {
     setUserApiKey(key);
     localStorage.setItem('lokalyze_api_key', key);
     setIsSettingsOpen(false);
-    triggerToast("Settings saved successfully");
+    triggerToast("Settings saved successfully", 'success');
   };
 
   // Source Code
@@ -140,8 +149,21 @@ const App: React.FC = () => {
   const [focusedJobId, setFocusedJobId] = useState<string | null>(null);
   const [isBatchRunning, setIsBatchRunning] = useState<boolean>(false);
   const [isDownloadingAssets, setIsDownloadingAssets] = useState<boolean>(false);
-  const [notification, setNotification] = useState<string | null>(null);
+  const [notification, setNotification] = useState<ToastMessage | null>(null);
   const [translatingImages, setTranslatingImages] = useState<Record<string, boolean>>({});
+  const [langFilter, setLangFilter] = useState<'all' | 'popular' | 'recent'>('all');
+  const [recentLangs, setRecentLangs] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('lokalyze_recent_langs') || '[]');
+    } catch {
+      return [];
+    }
+  });
+  const [historySort, setHistorySort] = useState<'recent' | 'oldest' | 'completion'>('recent');
+  const [monitorDensity, setMonitorDensity] = useState<'comfortable' | 'compact'>('comfortable');
+  const [onboardingDismissed, setOnboardingDismissed] = useState<boolean>(() =>
+    localStorage.getItem('lokalyze_onboarding_dismissed') === 'true'
+  );
 
   // References for processing loop
   const processingRefs = useRef<Set<string>>(new Set());
@@ -154,6 +176,16 @@ const App: React.FC = () => {
   useEffect(() => localStorage.setItem(KEYS.ASSETS, JSON.stringify(detectedImages)), [detectedImages]);
   useEffect(() => localStorage.setItem(KEYS.IFRAMES, JSON.stringify(detectedIframes)), [detectedIframes]);
   useEffect(() => localStorage.setItem(KEYS.SOUND, String(soundEnabled)), [soundEnabled]);
+  useEffect(() => localStorage.setItem('lokalyze_recent_langs', JSON.stringify(recentLangs.slice(0, 8))), [recentLangs]);
+  useEffect(() => localStorage.setItem('lokalyze_onboarding_dismissed', String(onboardingDismissed)), [onboardingDismissed]);
+
+  useEffect(() => {
+    if (selectedLangs.length === 0) return;
+    setRecentLangs(prev => {
+      const merged = [...selectedLangs, ...prev];
+      return Array.from(new Set(merged)).slice(0, 8);
+    });
+  }, [selectedLangs]);
 
   // CLEANUP CRASH CAUSING LOCALSTORAGE KEY
   useEffect(() => {
@@ -257,10 +289,44 @@ const App: React.FC = () => {
 
   // -- BUSINESS LOGIC: CORE ACTIONS --
 
-  const triggerToast = (msg: string) => {
-    setNotification(msg);
-    setTimeout(() => setNotification(null), 3000);
+  const triggerToast = (message: string, type: ToastVariant = 'info') => {
+    const nextToast: ToastMessage = { id: generateId(), message, type };
+    setNotification(nextToast);
+    setTimeout(() => {
+      setNotification(prev => prev?.id === nextToast.id ? null : prev);
+    }, 3200);
   };
+
+  const popularLanguages = useMemo(() => ['English', 'Spanish', 'French', 'German', 'Portuguese'], []);
+  const displayedLanguages = useMemo(() => {
+    if (!uiFlags.selector) return LANGUAGES;
+    if (langFilter === 'popular') return LANGUAGES.filter(lang => popularLanguages.includes(lang));
+    if (langFilter === 'recent') return LANGUAGES.filter(lang => recentLangs.includes(lang));
+    return LANGUAGES;
+  }, [langFilter, popularLanguages, recentLangs, uiFlags.selector]);
+
+  const sortedHistory = useMemo(() => {
+    const list = [...history];
+    if (historySort === 'oldest') {
+      return list.sort((a, b) => a.createdAt - b.createdAt);
+    }
+    if (historySort === 'completion') {
+      return list.sort((a, b) => {
+        const aTotal = Math.max(Object.keys(a.jobs || {}).length, 1);
+        const bTotal = Math.max(Object.keys(b.jobs || {}).length, 1);
+        const aDone = (Object.values(a.jobs || {}) as TranslationJob[]).filter(j => j.status === 'completed').length / aTotal;
+        const bDone = (Object.values(b.jobs || {}) as TranslationJob[]).filter(j => j.status === 'completed').length / bTotal;
+        return bDone - aDone;
+      });
+    }
+    return list.sort((a, b) => b.createdAt - a.createdAt);
+  }, [history, historySort]);
+
+  const syncModeLabel = useMemo(() => {
+    if (!user) return 'Local Mode';
+    return import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY ? 'Cloud Sync' : 'Local + Auth';
+  }, [user]);
+  const jobsList = useMemo(() => Object.values(jobs) as TranslationJob[], [jobs]);
 
   const playNotificationSound = useCallback((type: 'success' | 'click') => {
     if (!soundEnabled) return;
@@ -293,6 +359,10 @@ const App: React.FC = () => {
     }
   }, [soundEnabled]);
 
+  const toggleLanguage = (lang: string) => {
+    setSelectedLangs(prev => prev.includes(lang) ? prev.filter(l => l !== lang) : [...prev, lang]);
+  };
+
   const updateAsset = (id: string, newUrl: string) => {
     setDetectedImages(prev => prev.map(img =>
       img.id === id ? { ...img, replacementUrl: newUrl } : img
@@ -319,7 +389,7 @@ const App: React.FC = () => {
       setTranslatingImages(prev => ({ ...prev, [img.id]: true }));
 
       if (!aiClient) {
-        triggerToast('No API key set. Open Settings to add your Gemini API key.');
+        triggerToast('No API key set. Open Settings to add your Gemini API key.', 'warning');
         return;
       }
 
@@ -358,7 +428,7 @@ const App: React.FC = () => {
       if (generatedBase64) {
         const imageUrl = `data:image/png;base64,${generatedBase64}`;
         updateAsset(img.id, imageUrl);
-        triggerToast("Image translated & override set!");
+        triggerToast("Image translated & override set!", 'success');
         playNotificationSound('success');
       } else {
         throw new Error("No image data returned from model");
@@ -366,7 +436,7 @@ const App: React.FC = () => {
 
     } catch (e: any) {
       console.error(e);
-      triggerToast(e.message || "Image translation failed (CORS or Model Error)");
+      triggerToast(e.message || "Image translation failed (CORS or Model Error)", 'error');
     } finally {
       setTranslatingImages(prev => ({ ...prev, [img.id]: false }));
     }
@@ -382,17 +452,17 @@ const App: React.FC = () => {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    triggerToast(`Downloaded ${lang} file`);
+    triggerToast(`Downloaded ${lang} file`, 'success');
   };
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
-    triggerToast("Copied to clipboard");
+    triggerToast("Copied to clipboard", 'success');
   };
 
   const loadProject = (project: Project) => {
     if (isBatchRunning) {
-      triggerToast("Cannot load while batch is running");
+      triggerToast("Cannot load while batch is running", 'warning');
       return;
     }
 
@@ -416,7 +486,7 @@ const App: React.FC = () => {
       setHistory(prev => prev.filter(p => p.id !== id));
       if (activeProjectId === id) setActiveProjectId(null);
       // Delete from hybrid DB (local + cloud)
-      hybridDb.delete(id, user?.uid).then(() => triggerToast("Project deleted"));
+      hybridDb.delete(id, user?.uid).then(() => triggerToast("Project deleted", 'success'));
     }
   };
 
@@ -430,7 +500,7 @@ const App: React.FC = () => {
         const fetchRes = await fetch(url);
         const blob = await fetchRes.blob();
         saveAs(blob, filename || 'translated-image.png');
-        triggerToast("Download complete");
+        triggerToast("Download complete", 'success');
         return;
       }
 
@@ -439,17 +509,17 @@ const App: React.FC = () => {
       const blob = await response.blob();
       const name = filename || url.split('/').pop()?.split('?')[0] || 'image.png';
       saveAs(blob, name);
-      triggerToast("Download complete");
+      triggerToast("Download complete", 'success');
     } catch (e) {
       console.warn("Direct download failed, opening in new tab", e);
       // Fallback: Open in new tab
       window.open(url, '_blank');
-      triggerToast("Opened in new tab (CORS restricted)");
+      triggerToast("Opened in new tab (CORS restricted)", 'warning');
     }
   };
 
   const downloadAllAssets = async () => {
-    if (detectedImages.length === 0) return triggerToast("No assets to download");
+    if (detectedImages.length === 0) return triggerToast("No assets to download", 'warning');
     setIsDownloadingAssets(true);
     triggerToast("Packaging assets... this may take a moment");
 
@@ -504,11 +574,11 @@ const App: React.FC = () => {
 
       const content = await zip.generateAsync({ type: "blob" });
       saveAs(content, "lokalyze-assets.zip");
-      triggerToast(`Downloaded ${successCount} assets`);
+      triggerToast(`Downloaded ${successCount} assets`, 'success');
 
     } catch (e: any) {
       console.error(e);
-      triggerToast(e.message || "Batch download failed");
+      triggerToast(e.message || "Batch download failed", 'error');
     } finally {
       setIsDownloadingAssets(false);
     }
@@ -523,8 +593,29 @@ const App: React.FC = () => {
         ...prev,
         [jobId]: { ...prev[jobId], status: 'stopped' }
       }));
-      triggerToast('Job stopped manually');
+      triggerToast('Job stopped manually', 'warning');
     }
+  };
+
+  const retryJob = (jobId: string) => {
+    setJobs(prev => {
+      const current = prev[jobId];
+      if (!current) return prev;
+      return {
+        ...prev,
+        [jobId]: {
+          ...current,
+          status: 'queued',
+          error: undefined,
+          progress: 0,
+          translatedHtml: '',
+          tokenCount: 0,
+          startTime: 0,
+          endTime: undefined,
+        }
+      };
+    });
+    triggerToast('Job queued for retry', 'info');
   };
 
   // The Engine
@@ -662,14 +753,14 @@ ${preprocessedSource}`,
 
     if (isBatchRunning && active.length === 0 && queued.length === 0 && jobList.length > 0) {
       setIsBatchRunning(false);
-      triggerToast("All jobs completed");
+      triggerToast("All jobs completed", 'success');
       playNotificationSound('success');
     }
   }, [jobs, isBatchRunning, sourceHtml, activeProjectId, playNotificationSound]);
 
   const startBatch = () => {
-    if (selectedLangs.length === 0) return triggerToast("Select at least one language");
-    if (!sourceHtml.trim() || sourceHtml.length < 10) return triggerToast("Source HTML looks empty");
+    if (selectedLangs.length === 0) return triggerToast("Select at least one language", 'warning');
+    if (!sourceHtml.trim() || sourceHtml.length < 10) return triggerToast("Source HTML looks empty", 'warning');
 
     setIsBatchRunning(true);
     setActiveTab('monitor');
@@ -744,7 +835,15 @@ ${preprocessedSource}`,
   if (authLoading) {
     return (
       <div className="min-h-screen bg-zinc-50 dark:bg-[#050505] flex items-center justify-center">
-        <div className="animate-pulse text-zinc-400 font-mono text-xs uppercase tracking-widest">Loading...</div>
+        {uiFlags.base ? (
+          <div className="w-full max-w-sm space-y-3 p-6">
+            <Skeleton variant="line" />
+            <Skeleton variant="card" />
+            <Skeleton variant="line" />
+          </div>
+        ) : (
+          <div className="animate-pulse text-zinc-400 font-mono text-xs uppercase tracking-widest">Loading...</div>
+        )}
       </div>
     );
   }
@@ -756,9 +855,16 @@ ${preprocessedSource}`,
           <LokalyzeLogo />
           <h1 className="text-2xl font-black tracking-tight text-zinc-900 dark:text-white mt-4">Welcome to Lokalyze</h1>
           <p className="text-sm text-zinc-500 dark:text-zinc-400">Please sign in to access your workspace and translation history.</p>
+          {uiFlags.auth ? (
+            <div className="w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 text-left text-[11px] text-zinc-600 dark:border-white/10 dark:bg-black/30 dark:text-zinc-300">
+              <p className="font-bold uppercase tracking-wider text-[10px]">What happens next</p>
+              <p className="mt-1">Your projects stay available locally and can sync to cloud when configured.</p>
+            </div>
+          ) : null}
           <button
             onClick={handleLogin}
-            className="w-full h-12 bg-violet-600 hover:bg-violet-700 text-white rounded-xl font-bold uppercase tracking-widest text-[11px] transition-colors flex items-center justify-center gap-3 mt-4"
+            aria-label="Sign in with Google"
+            className="lk-focus-visible w-full h-12 bg-violet-600 hover:bg-violet-700 text-white rounded-xl font-bold uppercase tracking-widest text-[11px] transition-colors flex items-center justify-center gap-3 mt-4"
           >
             <Icons.User /> Sign in with Google
           </button>
@@ -779,13 +885,14 @@ ${preprocessedSource}`,
         onSave={saveSettings}
         user={user}
         onLogout={handleLogout}
+        v2Enabled={uiFlags.settings}
       />
 
       {/* Toast Notification */}
       {notification && (
-        <div className="fixed top-6 right-6 z-50 animate-[slideIn_0.3s_ease-out] flex items-center gap-3 bg-zinc-900 text-white px-5 py-3 rounded-xl shadow-2xl shadow-black/20 border border-white/10">
-          <div className="w-2 h-2 bg-emerald-400 rounded-full animate-pulse" />
-          <span className="text-xs font-bold uppercase tracking-wider">{notification}</span>
+        <div className={cn("fixed top-6 right-6 z-50 animate-[slideIn_0.3s_ease-out] flex items-center gap-3 px-5 py-3 rounded-xl shadow-2xl shadow-black/20 border", toastVariantStyles[notification.type])}>
+          <div className={cn("w-2 h-2 rounded-full animate-pulse", notification.type === 'success' ? 'bg-emerald-300' : notification.type === 'error' ? 'bg-red-300' : notification.type === 'warning' ? 'bg-amber-300' : 'bg-sky-300')} />
+          <span className="text-xs font-bold uppercase tracking-wider">{notification.message}</span>
         </div>
       )}
 
@@ -805,20 +912,23 @@ ${preprocessedSource}`,
                 {isBatchRunning ? 'Processing' : 'Ready'}
               </span>
             </div>
+            {uiFlags.shell ? (
+              <Badge tone={syncModeLabel === 'Cloud Sync' ? 'info' : 'neutral'}>{syncModeLabel}</Badge>
+            ) : null}
 
             <Tooltip content={soundEnabled ? "Mute Sounds" : "Enable Sounds"}>
-              <button onClick={() => setSoundEnabled(!soundEnabled)} className={`w-8 h-8 rounded-lg border flex items-center justify-center transition-colors ${soundEnabled ? 'border-zinc-200 dark:border-zinc-800 text-violet-500 bg-violet-50 dark:bg-violet-500/10' : 'border-zinc-200 dark:border-zinc-800 text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`}>
+              <button aria-label={soundEnabled ? "Mute sounds" : "Enable sounds"} onClick={() => setSoundEnabled(!soundEnabled)} className={`lk-focus-visible w-8 h-8 rounded-lg border flex items-center justify-center transition-colors ${soundEnabled ? 'border-zinc-200 dark:border-zinc-800 text-violet-500 bg-violet-50 dark:bg-violet-500/10' : 'border-zinc-200 dark:border-zinc-800 text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`}>
                 {soundEnabled ? <Icons.Volume2 /> : <Icons.VolumeX />}
               </button>
             </Tooltip>
 
             <Tooltip content="Settings">
-              <button onClick={() => setIsSettingsOpen(true)} className="w-8 h-8 rounded-lg border border-zinc-200 dark:border-zinc-800 flex items-center justify-center hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors text-zinc-500">
+              <button aria-label="Open settings" onClick={() => setIsSettingsOpen(true)} className="lk-focus-visible w-8 h-8 rounded-lg border border-zinc-200 dark:border-zinc-800 flex items-center justify-center hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors text-zinc-500">
                 <Icons.Settings />
               </button>
             </Tooltip>
             <Tooltip content="Toggle Theme">
-              <button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} className="w-8 h-8 rounded-lg border border-zinc-200 dark:border-zinc-800 flex items-center justify-center hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">
+              <button aria-label="Toggle theme" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} className="lk-focus-visible w-8 h-8 rounded-lg border border-zinc-200 dark:border-zinc-800 flex items-center justify-center hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">
                 {theme === 'dark' ? '☼' : '☾'}
               </button>
             </Tooltip>
@@ -828,6 +938,19 @@ ${preprocessedSource}`,
 
       {/* MAIN CONTENT AREA */}
       <main className="flex-1 w-full max-w-[1800px] mx-auto p-4 md:p-6 grid grid-cols-1 xl:grid-cols-12 gap-6 h-auto xl:h-[calc(100vh-64px)] pb-24">
+        {uiFlags.onboarding && !onboardingDismissed && history.length === 0 ? (
+          <section className="xl:col-span-12 rounded-2xl border border-violet-200 bg-violet-50 px-4 py-3 dark:border-violet-500/30 dark:bg-violet-500/10">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-widest text-violet-700 dark:text-violet-300">Quick Start</p>
+                <p className="mt-1 text-xs text-violet-800 dark:text-violet-200">1) Paste HTML 2) Select languages 3) Run batch. Your first translation usually completes in under a minute.</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button variant="secondary" onClick={() => setOnboardingDismissed(true)}>Dismiss</Button>
+              </div>
+            </div>
+          </section>
+        ) : null}
 
         {/* COLUMN 1: INPUT BUFFER */}
         <div className="xl:col-span-4 flex flex-col gap-6 h-[600px] xl:h-full overflow-hidden">
@@ -847,6 +970,11 @@ ${preprocessedSource}`,
                 {inputTab === 'html' ? `${sourceHtml.length}` : `${globalCss.length}`} chars
               </div>
             </div>
+            {uiFlags.editor && inputTab === 'html' && sourceHtml.trim().length < 10 ? (
+              <div className="px-3 py-2 border-b border-zinc-100 dark:border-white/5">
+                <InlineMessage tone="warning">Source HTML looks short. Paste a complete snippet for best results.</InlineMessage>
+              </div>
+            ) : null}
             <div className="flex-1 w-full overflow-hidden">
               <Suspense fallback={<div className="flex items-center justify-center h-full text-zinc-400 text-xs font-mono">Loading editor...</div>}>
                 <Editor
@@ -886,11 +1014,24 @@ ${preprocessedSource}`,
 
             {/* Scrollable Language List */}
             <div className="flex-1 overflow-y-auto custom-scrollbar p-4">
+              {uiFlags.selector ? (
+                <div className="mb-3 flex items-center gap-2">
+                  <button onClick={() => setLangFilter('all')} className={`lk-focus-visible rounded-lg px-2 py-1 text-[9px] font-bold uppercase tracking-widest ${langFilter === 'all' ? 'bg-violet-600 text-white' : 'bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-300'}`}>All</button>
+                  <button onClick={() => setLangFilter('popular')} className={`lk-focus-visible rounded-lg px-2 py-1 text-[9px] font-bold uppercase tracking-widest ${langFilter === 'popular' ? 'bg-violet-600 text-white' : 'bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-300'}`}>Popular</button>
+                  <button onClick={() => setLangFilter('recent')} className={`lk-focus-visible rounded-lg px-2 py-1 text-[9px] font-bold uppercase tracking-widest ${langFilter === 'recent' ? 'bg-violet-600 text-white' : 'bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-300'}`}>Recent</button>
+                  <button onClick={() => setSelectedLangs([])} className="lk-focus-visible ml-auto rounded-lg px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-white">Clear</button>
+                </div>
+              ) : null}
               <div className="grid grid-cols-2 gap-2">
-                {LANGUAGES.map(lang => (
+                {displayedLanguages.length === 0 ? (
+                  <div className="col-span-2 rounded-xl border border-dashed border-zinc-300 px-3 py-4 text-center text-[10px] text-zinc-500 dark:border-zinc-700 dark:text-zinc-300">
+                    No languages in this filter yet.
+                  </div>
+                ) : null}
+                {displayedLanguages.map(lang => (
                   <button
                     key={lang}
-                    onClick={() => setSelectedLangs(prev => prev.includes(lang) ? prev.filter(l => l !== lang) : [...prev, lang])}
+                    onClick={() => toggleLanguage(lang)}
                     className={`px-3 py-2.5 rounded-xl text-[10px] font-bold uppercase tracking-wider text-left border transition-all ${selectedLangs.includes(lang) ? 'bg-violet-600 border-violet-500 text-white shadow-lg shadow-violet-500/20' : 'bg-zinc-50 dark:bg-zinc-900/50 border-zinc-200 dark:border-zinc-800 text-zinc-500 hover:border-zinc-300 dark:hover:border-zinc-700'}`}
                   >
                     <div className="flex items-center justify-between w-full">
@@ -962,59 +1103,90 @@ ${preprocessedSource}`,
               <div className="flex h-full flex-col lg:flex-row">
                 {/* LIST VIEW - FIXED: Use w-96 fixed width on desktop to prevent shrinking, hidden on mobile when detailed view active */}
                 <div className={`${focusedJobId ? 'hidden lg:flex' : 'flex'} w-full lg:w-96 shrink-0 flex-col border-r border-zinc-100 dark:border-white/5 transition-all duration-300 h-full`}>
-                  <div className="p-4 border-b border-zinc-100 dark:border-white/5 flex justify-between items-center bg-zinc-50/50 dark:bg-black/20 shrink-0">
-                    <div className="flex flex-col">
-                      <span className="text-[10px] font-black uppercase tracking-widest text-zinc-400">Process Queue</span>
-                      {activeProjectId && <span className="text-[9px] font-bold text-violet-500 mt-0.5 truncate max-w-[150px]">{history.find(h => h.id === activeProjectId)?.name}</span>}
+                  <div className="p-4 border-b border-zinc-100 dark:border-white/5 flex justify-between items-start bg-zinc-50/50 dark:bg-black/20 shrink-0">
+                    <div className="flex flex-col gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-black uppercase tracking-widest text-zinc-400">Process Queue</span>
+                        {uiFlags.monitor ? (
+                          <Badge tone="info">{monitorDensity === 'compact' ? 'Compact' : 'Comfortable'}</Badge>
+                        ) : null}
+                      </div>
+                      {activeProjectId && <span className="text-[9px] font-bold text-violet-500 mt-0.5 truncate max-w-[200px]">{history.find(h => h.id === activeProjectId)?.name}</span>}
+                      {uiFlags.monitor ? (
+                        <div className="flex flex-wrap gap-1 pt-1">
+                          <span className={cn("rounded-md px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider", statusVariantStyles.queued)}>Queued</span>
+                          <span className={cn("rounded-md px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider", statusVariantStyles.translating)}>Running</span>
+                          <span className={cn("rounded-md px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider", statusVariantStyles.completed)}>Done</span>
+                          <span className={cn("rounded-md px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider", statusVariantStyles.error)}>Error</span>
+                          <span className={cn("rounded-md px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider", statusVariantStyles.stopped)}>Stopped</span>
+                        </div>
+                      ) : null}
                     </div>
-                    <span className="text-[9px] font-mono text-zinc-500">{Object.keys(jobs).length} Threads</span>
+                    <div className="flex flex-col items-end gap-2">
+                      <span className="text-[9px] font-mono text-zinc-500">{jobsList.length} Threads</span>
+                      {uiFlags.monitor ? (
+                        <button
+                          onClick={() => setMonitorDensity(prev => prev === 'comfortable' ? 'compact' : 'comfortable')}
+                          className="lk-focus-visible rounded-lg border border-zinc-200 px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                        >
+                          {monitorDensity === 'comfortable' ? 'Compact' : 'Comfort'}
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
-                  <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar bg-zinc-50/30 dark:bg-black/10">
-                    {Object.keys(jobs).length === 0 && (
-                      <div className="h-full flex flex-col items-center justify-center opacity-40 gap-6 p-6">
-                        <div className="w-20 h-20 rounded-3xl bg-zinc-100 dark:bg-white/5 flex items-center justify-center text-3xl grayscale">⚡</div>
-                        <div className="text-center space-y-4 max-w-[200px]">
-                          <p className="text-xs font-bold uppercase tracking-widest text-zinc-400">System Ready</p>
-                          <div className="text-left space-y-3">
-                            <div className="flex items-center gap-3">
-                              <span className="w-5 h-5 rounded-full bg-zinc-200 dark:bg-white/10 flex items-center justify-center text-[9px] font-bold">1</span>
-                              <span className="text-[10px] text-zinc-500">Paste HTML source</span>
-                            </div>
-                            <div className="flex items-center gap-3">
-                              <span className="w-5 h-5 rounded-full bg-zinc-200 dark:bg-white/10 flex items-center justify-center text-[9px] font-bold">2</span>
-                              <span className="text-[10px] text-zinc-500">Select Languages</span>
-                            </div>
-                            <div className="flex items-center gap-3">
-                              <span className="w-5 h-5 rounded-full bg-zinc-200 dark:bg-white/10 flex items-center justify-center text-[9px] font-bold">3</span>
-                              <span className="text-[10px] text-zinc-500">Initialize Batch</span>
+                  <div className={cn("flex-1 overflow-y-auto custom-scrollbar bg-zinc-50/30 dark:bg-black/10", monitorDensity === 'compact' ? 'p-2 space-y-2' : 'p-4 space-y-3')}>
+                    {jobsList.length === 0 && (
+                      uiFlags.monitor ? (
+                        <EmptyState
+                          icon={<span className="text-3xl">⚡</span>}
+                          title="System Ready"
+                          body="Paste HTML source, select languages, and initialize a batch to start the queue."
+                        />
+                      ) : (
+                        <div className="h-full flex flex-col items-center justify-center opacity-40 gap-6 p-6">
+                          <div className="w-20 h-20 rounded-3xl bg-zinc-100 dark:bg-white/5 flex items-center justify-center text-3xl grayscale">⚡</div>
+                          <div className="text-center space-y-4 max-w-[200px]">
+                            <p className="text-xs font-bold uppercase tracking-widest text-zinc-400">System Ready</p>
+                            <div className="text-left space-y-3">
+                              <div className="flex items-center gap-3">
+                                <span className="w-5 h-5 rounded-full bg-zinc-200 dark:bg-white/10 flex items-center justify-center text-[9px] font-bold">1</span>
+                                <span className="text-[10px] text-zinc-500">Paste HTML source</span>
+                              </div>
+                              <div className="flex items-center gap-3">
+                                <span className="w-5 h-5 rounded-full bg-zinc-200 dark:bg-white/10 flex items-center justify-center text-[9px] font-bold">2</span>
+                                <span className="text-[10px] text-zinc-500">Select Languages</span>
+                              </div>
+                              <div className="flex items-center gap-3">
+                                <span className="w-5 h-5 rounded-full bg-zinc-200 dark:bg-white/10 flex items-center justify-center text-[9px] font-bold">3</span>
+                                <span className="text-[10px] text-zinc-500">Initialize Batch</span>
+                              </div>
                             </div>
                           </div>
                         </div>
-                      </div>
+                      )
                     )}
-                    {(Object.values(jobs) as TranslationJob[]).map(job => (
+                    {jobsList.map(job => (
                       <div
                         key={job.id}
                         onClick={() => setFocusedJobId(job.id)}
-                        className={`group cursor-pointer p-4 rounded-2xl border transition-all hover:bg-white dark:hover:bg-white/5 hover:shadow-lg relative overflow-hidden ${focusedJobId === job.id ? 'bg-white dark:bg-violet-900/10 border-violet-500/50 ring-1 ring-violet-500/20 shadow-xl' : 'bg-white dark:bg-[#121212] border-zinc-200 dark:border-white/5'}`}
+                        className={`group cursor-pointer rounded-2xl border transition-all hover:bg-white dark:hover:bg-white/5 hover:shadow-lg relative overflow-hidden ${monitorDensity === 'compact' ? 'p-2.5' : 'p-4'} ${focusedJobId === job.id ? 'bg-white dark:bg-violet-900/10 border-violet-500/50 ring-1 ring-violet-500/20 shadow-xl' : 'bg-white dark:bg-[#121212] border-zinc-200 dark:border-white/5'}`}
                       >
-                        <div className="flex justify-between items-center mb-3 relative z-10">
+                        <div className={cn("flex justify-between items-center relative z-10", monitorDensity === 'compact' ? 'mb-2' : 'mb-3')}>
                           <div className="flex items-center gap-3">
                             <div className={`w-2 h-8 rounded-full ${job.status === 'completed' ? 'bg-emerald-500' : job.status === 'error' ? 'bg-red-500' : job.status === 'stopped' ? 'bg-orange-400' : job.status === 'translating' ? 'bg-violet-500 animate-pulse' : 'bg-zinc-300'}`}></div>
                             <div>
-                              <span className="text-xs font-black uppercase tracking-tight block">{job.lang}</span>
+                              <span className={cn("font-black uppercase tracking-tight block", monitorDensity === 'compact' ? 'text-[11px]' : 'text-xs')}>{job.lang}</span>
                               {job.endTime && <span className="text-[9px] text-zinc-400 font-mono">{formatDuration(job.endTime - job.startTime)}</span>}
                             </div>
                           </div>
-                          {job.status === 'completed' && <span className="text-[10px] text-emerald-600 bg-emerald-100 dark:bg-emerald-500/10 px-2 py-0.5 rounded-full font-bold">DONE</span>}
-                          {job.status === 'error' && <span className="text-[10px] text-red-600 bg-red-100 dark:bg-red-500/10 px-2 py-0.5 rounded-full font-bold">ERR</span>}
-                          {job.status === 'stopped' && <span className="text-[10px] text-orange-600 bg-orange-100 dark:bg-orange-500/10 px-2 py-0.5 rounded-full font-bold">STOP</span>}
-                          {job.status === 'queued' && <span className="text-[10px] text-zinc-400 bg-zinc-100 dark:bg-white/5 px-2 py-0.5 rounded-full font-bold">WAIT</span>}
+                          <span className={cn("px-2 py-0.5 rounded-full font-bold uppercase tracking-widest", statusVariantStyles[job.status], monitorDensity === 'compact' ? 'text-[8px]' : 'text-[10px]')}>
+                            {job.status === 'completed' ? 'Done' : job.status === 'error' ? 'Error' : job.status === 'stopped' ? 'Stopped' : job.status === 'translating' ? 'Running' : 'Queued'}
+                          </span>
                         </div>
                         <div className="h-1.5 w-full bg-zinc-100 dark:bg-black rounded-full overflow-hidden relative z-10">
                           <div className={`h-full transition-all duration-300 ${job.status === 'error' ? 'bg-red-500' : job.status === 'completed' ? 'bg-emerald-500' : job.status === 'stopped' ? 'bg-orange-400' : 'bg-violet-500'}`} style={{ width: `${job.progress}%` }} />
                         </div>
-                        <div className="mt-2 flex justify-between items-center text-[9px] font-mono text-zinc-400 relative z-10 opacity-60 group-hover:opacity-100 transition-opacity">
+                        <div className={cn("flex justify-between items-center text-[9px] font-mono text-zinc-400 relative z-10 opacity-60 group-hover:opacity-100 transition-opacity", monitorDensity === 'compact' ? 'mt-1' : 'mt-2')}>
                           <span>{job.tokenCount > 0 ? `${(job.tokenCount / 1000).toFixed(1)}k tokens` : '0 tokens'}</span>
                           <span>{job.progress}%</span>
                         </div>
@@ -1027,6 +1199,16 @@ ${preprocessedSource}`,
                             title="Stop Generation"
                           >
                             <Icons.Close />
+                          </button>
+                        )}
+
+                        {(job.status === 'error' || job.status === 'stopped') && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); retryJob(job.id); }}
+                            className="absolute right-4 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-all bg-white dark:bg-zinc-800 px-2 py-1 rounded-lg shadow-lg hover:text-violet-500 z-50 border border-zinc-200 dark:border-white/10 text-[9px] font-bold uppercase tracking-widest"
+                            title="Retry Job"
+                          >
+                            Retry
                           </button>
                         )}
 
@@ -1047,7 +1229,7 @@ ${preprocessedSource}`,
                         <div>
                           <h2 className="text-xl font-black tracking-tighter flex items-center gap-3">
                             {jobs[focusedJobId].lang}
-                            <span className={`px-2 py-0.5 rounded-md text-[9px] uppercase tracking-widest text-white ${jobs[focusedJobId].status === 'completed' ? 'bg-emerald-500' : jobs[focusedJobId].status === 'stopped' ? 'bg-orange-500' : 'bg-violet-500'}`}>{jobs[focusedJobId].status}</span>
+                            <span className={cn("px-2 py-0.5 rounded-md text-[9px] uppercase tracking-widest", statusVariantStyles[jobs[focusedJobId].status])}>{jobs[focusedJobId].status}</span>
                           </h2>
                         </div>
                       </div>
@@ -1080,6 +1262,16 @@ ${preprocessedSource}`,
                       </div>
                     </div>
                     <div className="flex-1 overflow-hidden relative">
+                      {(jobs[focusedJobId].status === 'error' || jobs[focusedJobId].status === 'stopped') && uiFlags.monitor ? (
+                        <div className="p-4 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#0e0e0e]">
+                          <InlineMessage tone={jobs[focusedJobId].status === 'error' ? 'error' : 'warning'}>
+                            <div className="flex flex-wrap items-center gap-3">
+                              <span>{jobs[focusedJobId].error || 'This job was interrupted before completion.'}</span>
+                              <Button variant="secondary" onClick={() => retryJob(focusedJobId)}>Retry Job</Button>
+                            </div>
+                          </InlineMessage>
+                        </div>
+                      ) : null}
                       {jobs[focusedJobId].viewMode === 'preview' ? (
                         renderLivePreview(jobs[focusedJobId].translatedHtml)
                       ) : (
@@ -1106,12 +1298,22 @@ ${preprocessedSource}`,
                     </div>
                   </div>
                 ) : (
-                  <div className="flex-1 hidden lg:flex flex-col items-center justify-center text-zinc-300 dark:text-zinc-700 bg-zinc-50/50 dark:bg-black/20">
-                    <div className="w-32 h-32 rounded-[2rem] bg-white dark:bg-white/5 shadow-2xl flex items-center justify-center mb-8 rotate-3">
-                      <span className="text-5xl opacity-50">⚡</span>
-                    </div>
-                    <p className="text-xs font-black uppercase tracking-[0.2em] mb-2">Mainframe Output</p>
-                    <p className="text-[10px] text-zinc-400 max-w-xs text-center leading-relaxed">Select a completed job from the queue to inspect the code, preview the render, or download the assets.</p>
+                  <div className="flex-1 hidden lg:flex flex-col items-center justify-center text-zinc-300 dark:text-zinc-700 bg-zinc-50/50 dark:bg-black/20 p-8">
+                    {uiFlags.monitor ? (
+                      <EmptyState
+                        icon={<span className="text-5xl opacity-50">⚡</span>}
+                        title="Mainframe Output"
+                        body="Select a queue item to inspect preview, code, copy output, or download assets."
+                      />
+                    ) : (
+                      <>
+                        <div className="w-32 h-32 rounded-[2rem] bg-white dark:bg-white/5 shadow-2xl flex items-center justify-center mb-8 rotate-3">
+                          <span className="text-5xl opacity-50">⚡</span>
+                        </div>
+                        <p className="text-xs font-black uppercase tracking-[0.2em] mb-2">Mainframe Output</p>
+                        <p className="text-[10px] text-zinc-400 max-w-xs text-center leading-relaxed">Select a completed job from the queue to inspect the code, preview the render, or download the assets.</p>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -1123,19 +1325,40 @@ ${preprocessedSource}`,
                     <h3 className="text-[10px] font-black uppercase tracking-widest text-zinc-500">Project History</h3>
                     <p className="text-xs text-zinc-400 mt-1">Review, restore, or manage your translation batches.</p>
                   </div>
-                  <div className="text-[9px] bg-zinc-100 dark:bg-white/5 px-2 py-1 rounded text-zinc-400 font-mono">
-                    Total Projects: {history.length}
+                  <div className="flex items-center gap-2">
+                    {uiFlags.history ? (
+                      <select
+                        value={historySort}
+                        onChange={(e) => setHistorySort(e.target.value as 'recent' | 'oldest' | 'completion')}
+                        className="lk-focus-visible rounded-lg border border-zinc-200 bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-widest text-zinc-600 dark:border-zinc-700 dark:bg-black dark:text-zinc-300"
+                      >
+                        <option value="recent">Recent</option>
+                        <option value="oldest">Oldest</option>
+                        <option value="completion">Completion</option>
+                      </select>
+                    ) : null}
+                    <div className="text-[9px] bg-zinc-100 dark:bg-white/5 px-2 py-1 rounded text-zinc-400 font-mono">
+                      Total Projects: {history.length}
+                    </div>
                   </div>
                 </div>
                 <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar">
                   {history.length === 0 ? (
-                    <div className="h-full flex flex-col items-center justify-center border-2 border-dashed border-zinc-200 dark:border-zinc-800 rounded-3xl p-10 opacity-50">
-                      <Icons.History />
-                      <p className="text-xs font-bold text-zinc-400 uppercase mt-4">No History Found</p>
-                      <p className="text-[10px] text-zinc-500 mt-2">Start a translation batch to create a history record.</p>
-                    </div>
+                    uiFlags.history ? (
+                      <EmptyState
+                        icon={<Icons.History />}
+                        title="No History Found"
+                        body="Start a translation batch to create your first recoverable project."
+                      />
+                    ) : (
+                      <div className="h-full flex flex-col items-center justify-center border-2 border-dashed border-zinc-200 dark:border-zinc-800 rounded-3xl p-10 opacity-50">
+                        <Icons.History />
+                        <p className="text-xs font-bold text-zinc-400 uppercase mt-4">No History Found</p>
+                        <p className="text-[10px] text-zinc-500 mt-2">Start a translation batch to create a history record.</p>
+                      </div>
+                    )
                   ) : (
-                    history.map((project) => (
+                    (uiFlags.history ? sortedHistory : history).map((project) => (
                       <div key={project.id} className={`flex flex-col md:flex-row items-center justify-between gap-6 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 group hover:border-violet-500/30 hover:shadow-lg transition-all ${activeProjectId === project.id ? 'ring-1 ring-violet-500/50 border-violet-500/30' : ''}`}>
                         <div className="flex items-center gap-4 w-full md:w-auto">
                           <div className={`w-12 h-12 rounded-2xl flex items-center justify-center text-lg ${activeProjectId === project.id ? 'bg-violet-500 text-white shadow-lg shadow-violet-500/30' : 'bg-zinc-100 dark:bg-white/5 text-zinc-400'}`}>
@@ -1200,6 +1423,13 @@ ${preprocessedSource}`,
                   </div>
                 </div>
                 <div className="flex-1 overflow-y-auto p-6 space-y-8 custom-scrollbar">
+                  {uiFlags.assets && detectedImages.length === 0 && detectedIframes.length === 0 ? (
+                    <EmptyState
+                      icon={<Icons.Image />}
+                      title="No assets detected"
+                      body="Add image or iframe tags to your HTML and return here to configure overrides."
+                    />
+                  ) : null}
 
                   {/* SECTION: IFRAMES */}
                   {detectedIframes.length > 0 && (
@@ -1212,9 +1442,14 @@ ${preprocessedSource}`,
                           <div className="flex flex-col gap-2">
                             <label className="text-[9px] font-black uppercase tracking-widest text-zinc-400 flex items-center justify-between">
                               <span>Original Frame Source</span>
-                              <button onClick={() => copyToClipboard(iframe.originalUrl)} className="text-zinc-400 hover:text-indigo-500">
-                                <Icons.Copy />
-                              </button>
+                              <div className="flex items-center gap-2">
+                                <Badge tone={iframe.htmlContent ? 'success' : iframe.replacementUrl ? 'info' : 'neutral'}>
+                                  {iframe.htmlContent ? 'Deep' : iframe.replacementUrl ? 'Override' : 'Untouched'}
+                                </Badge>
+                                <button onClick={() => copyToClipboard(iframe.originalUrl)} className="text-zinc-400 hover:text-indigo-500">
+                                  <Icons.Copy />
+                                </button>
+                              </div>
                             </label>
                             <code className="text-[10px] bg-zinc-50 dark:bg-black px-3 py-2 rounded-lg border border-zinc-200 dark:border-white/10 text-zinc-500 truncate font-mono select-all">{iframe.originalUrl}</code>
                           </div>
@@ -1239,40 +1474,79 @@ ${preprocessedSource}`,
                           </div>
 
                           {/* Option B: Deep Translate */}
-                          <div className="flex flex-col gap-2">
-                            <label className="text-[9px] font-black uppercase tracking-widest text-indigo-400 flex items-center gap-2">
-                              Option B: Deep Translate <span className="text-zinc-500 font-normal normal-case tracking-normal">(Paste Source HTML)</span>
-                            </label>
-                            <div className="relative group/editor h-32 w-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
-                              <Suspense fallback={<div className="flex items-center justify-center h-full text-zinc-400 text-xs font-mono">Loading...</div>}>
-                                <Editor
-                                  height="100%"
-                                  language="html"
-                                  theme={theme === 'dark' ? 'vs-dark' : 'light'}
-                                  value={iframe.htmlContent || ''}
-                                  onChange={(value) => updateIframeHtml(iframe.id, value || '')}
-                                  options={{
-                                    minimap: { enabled: false },
-                                    fontSize: 10,
-                                    lineNumbers: 'off',
-                                    scrollBeyondLastLine: false,
-                                    automaticLayout: true,
-                                    padding: { top: 8, bottom: 8 },
-                                    wordWrap: 'on',
-                                    fontFamily: 'JetBrains Mono, monospace',
-                                  }}
-                                />
-                              </Suspense>
-                              {iframe.htmlContent && (
-                                <div className="absolute right-3 top-3 text-emerald-500 bg-emerald-500/10 p-1 rounded z-10">
-                                  <Icons.Check />
+                          {uiFlags.assets ? (
+                            <details className="rounded-xl border border-zinc-200 bg-zinc-50/70 p-3 dark:border-zinc-800 dark:bg-black/40" open={Boolean(iframe.htmlContent)}>
+                              <summary className="cursor-pointer text-[10px] font-black uppercase tracking-widest text-indigo-500">
+                                Option B: Deep Translate
+                              </summary>
+                              <div className="mt-3 flex flex-col gap-2">
+                                <p className="text-[9px] text-zinc-500">
+                                  Paste Source HTML from this iframe to translate and inject using <code>srcdoc</code>.
+                                </p>
+                                <div className="relative group/editor h-32 w-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
+                                  <Suspense fallback={<div className="flex items-center justify-center h-full text-zinc-400 text-xs font-mono">Loading...</div>}>
+                                    <Editor
+                                      height="100%"
+                                      language="html"
+                                      theme={theme === 'dark' ? 'vs-dark' : 'light'}
+                                      value={iframe.htmlContent || ''}
+                                      onChange={(value) => updateIframeHtml(iframe.id, value || '')}
+                                      options={{
+                                        minimap: { enabled: false },
+                                        fontSize: 10,
+                                        lineNumbers: 'off',
+                                        scrollBeyondLastLine: false,
+                                        automaticLayout: true,
+                                        padding: { top: 8, bottom: 8 },
+                                        wordWrap: 'on',
+                                        fontFamily: 'JetBrains Mono, monospace',
+                                      }}
+                                    />
+                                  </Suspense>
+                                  {iframe.htmlContent && (
+                                    <div className="absolute right-3 top-3 text-emerald-500 bg-emerald-500/10 p-1 rounded z-10">
+                                      <Icons.Check />
+                                    </div>
+                                  )}
                                 </div>
-                              )}
+                              </div>
+                            </details>
+                          ) : (
+                            <div className="flex flex-col gap-2">
+                              <label className="text-[9px] font-black uppercase tracking-widest text-indigo-400 flex items-center gap-2">
+                                Option B: Deep Translate <span className="text-zinc-500 font-normal normal-case tracking-normal">(Paste Source HTML)</span>
+                              </label>
+                              <div className="relative group/editor h-32 w-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
+                                <Suspense fallback={<div className="flex items-center justify-center h-full text-zinc-400 text-xs font-mono">Loading...</div>}>
+                                  <Editor
+                                    height="100%"
+                                    language="html"
+                                    theme={theme === 'dark' ? 'vs-dark' : 'light'}
+                                    value={iframe.htmlContent || ''}
+                                    onChange={(value) => updateIframeHtml(iframe.id, value || '')}
+                                    options={{
+                                      minimap: { enabled: false },
+                                      fontSize: 10,
+                                      lineNumbers: 'off',
+                                      scrollBeyondLastLine: false,
+                                      automaticLayout: true,
+                                      padding: { top: 8, bottom: 8 },
+                                      wordWrap: 'on',
+                                      fontFamily: 'JetBrains Mono, monospace',
+                                    }}
+                                  />
+                                </Suspense>
+                                {iframe.htmlContent && (
+                                  <div className="absolute right-3 top-3 text-emerald-500 bg-emerald-500/10 p-1 rounded z-10">
+                                    <Icons.Check />
+                                  </div>
+                                )}
+                              </div>
+                              <p className="text-[9px] text-zinc-500">
+                                Paste the iframe's internal HTML here. The engine will translate it and inject it using <code>srcdoc</code>, bypassing the external URL.
+                              </p>
                             </div>
-                            <p className="text-[9px] text-zinc-500">
-                              Paste the iframe's internal HTML here. The engine will translate it and inject it using <code>srcdoc</code>, bypassing the external URL.
-                            </p>
-                          </div>
+                          )}
 
                         </div>
                       ))}
@@ -1285,10 +1559,20 @@ ${preprocessedSource}`,
                       <Icons.Image /> <span>Detected Images</span>
                     </div>
                     {detectedImages.length === 0 ? (
-                      <div className="flex flex-col items-center justify-center border-2 border-dashed border-zinc-200 dark:border-zinc-800 rounded-3xl p-10 opacity-50">
-                        <Icons.Image />
-                        <p className="text-xs font-bold text-zinc-400 uppercase mt-4">No &lt;img&gt; tags found</p>
-                      </div>
+                      uiFlags.assets ? (
+                        <EmptyState
+                          icon={<Icons.Image />}
+                          title="No image tags found"
+                          body="Add one or more <img> tags in your source HTML to use image overrides."
+                          ctaLabel="Open HTML Input"
+                          onCta={() => setInputTab('html')}
+                        />
+                      ) : (
+                        <div className="flex flex-col items-center justify-center border-2 border-dashed border-zinc-200 dark:border-zinc-800 rounded-3xl p-10 opacity-50">
+                          <Icons.Image />
+                          <p className="text-xs font-bold text-zinc-400 uppercase mt-4">No &lt;img&gt; tags found</p>
+                        </div>
+                      )
                     ) : (
                       detectedImages.map((img) => (
                         <div key={img.id} className="flex flex-col md:flex-row gap-6 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 group hover:border-violet-500/30 hover:shadow-lg transition-all">
@@ -1300,6 +1584,11 @@ ${preprocessedSource}`,
                               <label className="text-[9px] font-black uppercase tracking-widest text-zinc-400 flex items-center justify-between">
                                 <span>Original Source</span>
                                 <div className="flex items-center gap-1">
+                                  {uiFlags.assets ? (
+                                    <Badge tone={translatingImages[img.id] ? 'warning' : img.replacementUrl.startsWith('data:image') ? 'success' : img.replacementUrl ? 'info' : 'neutral'}>
+                                      {translatingImages[img.id] ? 'Generating' : img.replacementUrl.startsWith('data:image') ? 'AI' : img.replacementUrl ? 'Override' : 'Untouched'}
+                                    </Badge>
+                                  ) : null}
                                   <Tooltip content="Download Original">
                                     <button onClick={() => downloadAsset(img.originalUrl)} className="text-zinc-400 hover:text-violet-500 p-1">
                                       <Icons.Download />

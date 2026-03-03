@@ -4,6 +4,7 @@
 - [ ] Branch synced with `main`.
 - [ ] CI `quality-gate` green for current commit (`build_and_types`, `smoke_public`, `smoke_workspace`).
 - [ ] `npm run build` passed with no TypeScript errors.
+- [ ] `npm run perf:budget` passed (no JS bundle regression beyond guardrail).
 - [ ] `npm run smoke:local` passed.
 - [ ] `npm run test:smoke:all` passed (or explicitly waived with reason).
 - [ ] Kill-switch variables are present in Vercel:
@@ -12,6 +13,8 @@
   - `VITE_UI_V2_MONITOR`
   - `VITE_UI_V2_ASSETS`
   - `VITE_UI_V2_HISTORY`
+  - `VITE_UI_PERF_V1`
+  - `VITE_UI_V2_VIRTUAL_LISTS`
 - [ ] `VITE_DISABLE_FIREBASE_AUTH` is not set in production (test-only variable).
 - [ ] No unresolved blocker in critical flows: auth, batch, monitor, assets, history, settings.
 

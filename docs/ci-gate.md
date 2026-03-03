@@ -5,6 +5,7 @@ The `quality-gate` workflow is required for `main` and includes:
 - `build_and_types`
 - `smoke_public`
 - `smoke_workspace`
+- perf guardrail (`npm run perf:budget`) inside `build_and_types`
 
 Any failed job blocks release until fixed or formally waived according to policy.
 
@@ -14,6 +15,7 @@ Run in this order:
 ```bash
 npm ci
 npm run build
+npm run perf:budget
 npx tsc --noEmit
 npm run test:smoke:public
 npm run test:smoke:workspace
@@ -21,7 +23,7 @@ npm run test:smoke:workspace
 
 ## Interpreting Failures
 - `build_and_types` failed:
-  - Type/import/build regression. Fix before merge.
+  - Type/import/build/perf-budget regression. Fix before merge.
 - `smoke_public` failed:
   - Entry app availability/auth-gate visibility regressed.
 - `smoke_workspace` failed:

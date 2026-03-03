@@ -1,0 +1,5 @@
+{
+  "baselineBundleBytes": 839500,
+  "allowedRegressionPercent": 5,
+  "targetReductionPercent": 20
+}

@@ -1,8 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback, lazy, Suspense, Component } from 'react';
 import { createRoot } from 'react-dom/client';
-import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
-import JSZip from 'jszip';
-import saveAs from 'file-saver';
+import type { GenerateContentResponse } from "@google/genai";
 const Editor = lazy(() => import('@monaco-editor/react'));
 import { User } from 'firebase/auth';
 import { auth, signInWithPopup, googleProvider, signOut, onAuthStateChanged, isConfigured as isFirebaseConfigured } from './src/firebase';
@@ -15,6 +13,8 @@ import type { ToastMessage, ToastVariant } from './src/uiTypes';
 import { Analytics, generateId, cleanStreamedHtml, formatDuration, formatDate, safeAssetId, urlToBase64 } from './src/utils';
 import { useDebounce } from './src/hooks';
 import { resolveUiFlags } from './src/featureFlags';
+import { isPerfV1Enabled, isVirtualListsEnabled } from './src/perfFlags';
+import type { PerfBudgetSnapshot, UiInteractionEventName } from './src/perfTypes';
 
 import Icons from './src/components/Icons';
 import { LokalyzeLogo, ApxlbsLogo } from './src/components/Logo';
@@ -61,6 +61,39 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBounda
   }
 }
 
+let aiClientByKey = new Map<string, Promise<any>>();
+let fileSaverModulePromise: Promise<any> | null = null;
+let jsZipModulePromise: Promise<any> | null = null;
+
+const getAiClient = async (apiKey: string) => {
+  if (!apiKey) return null;
+  const existing = aiClientByKey.get(apiKey);
+  if (existing) return existing;
+
+  const created = import('@google/genai').then(({ GoogleGenAI }) => new GoogleGenAI({ apiKey }));
+  aiClientByKey.set(apiKey, created);
+  return created;
+};
+
+const saveBlobAsFile = async (blob: Blob, filename: string) => {
+  if (!fileSaverModulePromise) {
+    fileSaverModulePromise = import('file-saver');
+  }
+  const fileSaver = await fileSaverModulePromise;
+  const saveAsFn = fileSaver?.saveAs || fileSaver?.default;
+  if (!saveAsFn) throw new Error('FileSaver module unavailable');
+  saveAsFn(blob, filename);
+};
+
+const createZip = async () => {
+  if (!jsZipModulePromise) {
+    jsZipModulePromise = import('jszip');
+  }
+  const zipModule = await jsZipModulePromise;
+  const JSZipCtor = zipModule?.default || zipModule;
+  return new JSZipCtor();
+};
+
 // --- APP COMPONENT ---
 const App: React.FC = () => {
   // -- STATE: PERSISTENCE LAYER (PHASE A) --
@@ -75,13 +108,20 @@ const App: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const uiFlags = useMemo(() => resolveUiFlags(user?.uid), [user?.uid]);
+  const perfV1Enabled = useMemo(() => isPerfV1Enabled(), []);
+  const virtualListsEnabled = useMemo(() => isVirtualListsEnabled(), []);
+  const appBootRef = useRef(typeof performance !== 'undefined' ? performance.now() : 0);
+  const firstActionTrackedRef = useRef(false);
+  const tabSwitchStartRef = useRef<number | null>(null);
+  const jobDetailOpenStartRef = useRef<Record<string, number>>({});
+  const [perfSnapshot, setPerfSnapshot] = useState<PerfBudgetSnapshot>({
+    bundleBytes: 0,
+    initialRenderMs: 0,
+    tabSwitchMs: 0,
+  });
 
-  // Memoized AI client — null when no key provided (avoids throwing on init)
+  // API key can come from local settings or env fallback.
   const effectiveApiKey = userApiKey || import.meta.env.VITE_GEMINI_API_KEY || '';
-  const aiClient = useMemo(
-    () => effectiveApiKey ? new GoogleGenAI({ apiKey: effectiveApiKey }) : null,
-    [effectiveApiKey]
-  );
 
   useEffect(() => {
     if (isFirebaseConfigured && auth) {
@@ -173,6 +213,7 @@ const App: React.FC = () => {
 
   // History / Projects - Initialized as empty, loaded async
   const [history, setHistory] = useState<Project[]>([]);
+  const [isHistoryLoading, setIsHistoryLoading] = useState<boolean>(true);
 
   // Current Task Context
   const [taskName, setTaskName] = useState<string>('');
@@ -213,9 +254,46 @@ const App: React.FC = () => {
   const [onboardingDismissed, setOnboardingDismissed] = useState<boolean>(() =>
     localStorage.getItem('lokalyze_onboarding_dismissed') === 'true'
   );
+  const [jobRenderLimit, setJobRenderLimit] = useState(80);
+  const [historyRenderLimit, setHistoryRenderLimit] = useState(80);
+  const [imageRenderLimit, setImageRenderLimit] = useState(60);
+  const [iframeRenderLimit, setIframeRenderLimit] = useState(40);
 
   // References for processing loop
   const processingRefs = useRef<Set<string>>(new Set());
+
+  const trackFirstAction = useCallback((action: string) => {
+    if (!perfV1Enabled || firstActionTrackedRef.current) return;
+    firstActionTrackedRef.current = true;
+    const elapsed = Math.max(0, Math.round(performance.now() - appBootRef.current));
+    Analytics.track('time_to_first_action', { action, ms: elapsed });
+    setPerfSnapshot(prev => ({ ...prev, initialRenderMs: elapsed }));
+  }, [perfV1Enabled]);
+
+  const trackUiInteraction = useCallback((event: UiInteractionEventName, props: Record<string, unknown> = {}) => {
+    Analytics.track(event, props);
+  }, []);
+
+  const openTab = useCallback((tab: 'monitor' | 'assets' | 'history') => {
+    tabSwitchStartRef.current = performance.now();
+    setActiveTab(tab);
+    trackFirstAction('tab_switch');
+    trackUiInteraction('panel_opened', { panel: tab });
+  }, [trackFirstAction, trackUiInteraction]);
+
+  const openJobDetail = useCallback((jobId: string) => {
+    jobDetailOpenStartRef.current[jobId] = performance.now();
+    setFocusedJobId(jobId);
+    trackFirstAction('open_job_detail');
+    trackUiInteraction('job_detail_toggled', { jobId, action: 'open' });
+  }, [trackFirstAction, trackUiInteraction]);
+
+  const closeJobDetail = useCallback(() => {
+    if (focusedJobId) {
+      trackUiInteraction('job_detail_toggled', { jobId: focusedJobId, action: 'close' });
+    }
+    setFocusedJobId(null);
+  }, [focusedJobId, trackUiInteraction]);
 
   // -- EFFECTS: PERSISTENCE & INTEGRITY --
   useEffect(() => { document.documentElement.className = theme; }, [theme]);
@@ -227,6 +305,20 @@ const App: React.FC = () => {
   useEffect(() => localStorage.setItem(KEYS.SOUND, String(soundEnabled)), [soundEnabled]);
   useEffect(() => localStorage.setItem('lokalyze_recent_langs', JSON.stringify(recentLangs.slice(0, 8))), [recentLangs]);
   useEffect(() => localStorage.setItem('lokalyze_onboarding_dismissed', String(onboardingDismissed)), [onboardingDismissed]);
+
+  useEffect(() => {
+    if (!perfV1Enabled) return;
+    try {
+      const resources = performance.getEntriesByType('resource') as PerformanceResourceTiming[];
+      const jsResources = resources.filter(item => item.name.includes('.js'));
+      const bundleBytesEstimate = Math.max(0, ...jsResources.map(item => item.transferSize || 0));
+      if (bundleBytesEstimate > 0) {
+        setPerfSnapshot(prev => ({ ...prev, bundleBytes: bundleBytesEstimate }));
+      }
+    } catch {
+      // Perf APIs can be unavailable depending on browser settings.
+    }
+  }, [perfV1Enabled]);
 
   useEffect(() => {
     if (selectedLangs.length === 0) return;
@@ -246,9 +338,43 @@ const App: React.FC = () => {
   // LOAD HISTORY ON MOUNT (cloud if logged in, local otherwise)
   useEffect(() => {
     if (!authLoading) {
-      hybridDb.getAll(user?.uid).then(setHistory);
+      setIsHistoryLoading(true);
+      hybridDb.getAll(user?.uid)
+        .then(setHistory)
+        .finally(() => setIsHistoryLoading(false));
     }
   }, [authLoading, user]);
+
+  useEffect(() => {
+    if (!perfV1Enabled || tabSwitchStartRef.current === null) return;
+    const startedAt = tabSwitchStartRef.current;
+    let frame2 = 0;
+    const frame = requestAnimationFrame(() => {
+      frame2 = requestAnimationFrame(() => {
+        const elapsed = Math.max(0, Math.round(performance.now() - startedAt));
+        Analytics.track('tab_switch_latency', { panel: activeTab, ms: elapsed });
+        setPerfSnapshot(prev => ({ ...prev, tabSwitchMs: elapsed }));
+        tabSwitchStartRef.current = null;
+      });
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (frame2) cancelAnimationFrame(frame2);
+    };
+  }, [activeTab, perfV1Enabled]);
+
+  useEffect(() => {
+    if (!perfV1Enabled || !focusedJobId) return;
+    const startedAt = jobDetailOpenStartRef.current[focusedJobId];
+    if (!startedAt) return;
+
+    const frame = requestAnimationFrame(() => {
+      const elapsed = Math.max(0, Math.round(performance.now() - startedAt));
+      Analytics.track('job_detail_open_latency', { jobId: focusedJobId, ms: elapsed });
+      delete jobDetailOpenStartRef.current[focusedJobId];
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [focusedJobId, perfV1Enabled]);
 
   // SAVE ACTIVE PROJECT GRANULARLY (Debounced — avoids writing on every streaming progress tick)
   useEffect(() => {
@@ -376,10 +502,30 @@ const App: React.FC = () => {
     return import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY ? 'Cloud Sync' : 'Local + Auth';
   }, [user]);
   const jobsList = useMemo(() => Object.values(jobs) as TranslationJob[], [jobs]);
+  const visibleJobs = useMemo(() => {
+    if (!virtualListsEnabled) return jobsList;
+    return jobsList.slice(0, jobRenderLimit);
+  }, [jobsList, virtualListsEnabled, jobRenderLimit]);
   const activeProject = useMemo(
     () => (activeProjectId ? history.find(h => h.id === activeProjectId) || null : null),
     [history, activeProjectId]
   );
+  const historyList = useMemo(
+    () => (uiFlags.history ? sortedHistory : history),
+    [uiFlags.history, sortedHistory, history]
+  );
+  const visibleHistory = useMemo(() => {
+    if (!virtualListsEnabled) return historyList;
+    return historyList.slice(0, historyRenderLimit);
+  }, [historyList, virtualListsEnabled, historyRenderLimit]);
+  const visibleDetectedImages = useMemo(() => {
+    if (!virtualListsEnabled) return detectedImages;
+    return detectedImages.slice(0, imageRenderLimit);
+  }, [detectedImages, virtualListsEnabled, imageRenderLimit]);
+  const visibleDetectedIframes = useMemo(() => {
+    if (!virtualListsEnabled) return detectedIframes;
+    return detectedIframes.slice(0, iframeRenderLimit);
+  }, [detectedIframes, virtualListsEnabled, iframeRenderLimit]);
   const imageOverrideCount = useMemo(
     () => detectedImages.filter(i => i.replacementUrl.trim().length > 0).length,
     [detectedImages]
@@ -388,6 +534,15 @@ const App: React.FC = () => {
     () => detectedImages.length + detectedIframes.length,
     [detectedImages.length, detectedIframes.length]
   );
+
+  useEffect(() => {
+    if (activeTab === 'monitor') setJobRenderLimit(80);
+    if (activeTab === 'history') setHistoryRenderLimit(80);
+    if (activeTab === 'assets') {
+      setImageRenderLimit(60);
+      setIframeRenderLimit(40);
+    }
+  }, [activeTab]);
 
   const playNotificationSound = useCallback((type: 'success' | 'click') => {
     if (!soundEnabled) return;
@@ -420,36 +575,42 @@ const App: React.FC = () => {
     }
   }, [soundEnabled]);
 
-  const toggleLanguage = (lang: string) => {
+  const toggleLanguage = useCallback((lang: string) => {
+    trackFirstAction('select_language');
     setSelectedLangs(prev => prev.includes(lang) ? prev.filter(l => l !== lang) : [...prev, lang]);
-  };
+  }, [trackFirstAction]);
 
-  const updateAsset = (id: string, newUrl: string) => {
+  const updateAsset = useCallback((id: string, newUrl: string) => {
     setDetectedImages(prev => prev.map(img =>
       img.id === id ? { ...img, replacementUrl: newUrl } : img
     ));
     Analytics.track('asset_updated', { assetId: id });
-  };
+    Analytics.track('asset_override_applied', { assetId: id, assetType: 'image' });
+  }, []);
 
-  const updateIframeUrl = (id: string, newUrl: string) => {
+  const updateIframeUrl = useCallback((id: string, newUrl: string) => {
     setDetectedIframes(prev => prev.map(iframe =>
       iframe.id === id ? { ...iframe, replacementUrl: newUrl } : iframe
     ));
     Analytics.track('iframe_updated', { iframeId: id, type: 'url' });
-  };
+    Analytics.track('asset_override_applied', { assetId: id, assetType: 'iframe_url' });
+  }, []);
 
-  const updateIframeHtml = (id: string, newHtml: string) => {
+  const updateIframeHtml = useCallback((id: string, newHtml: string) => {
     setDetectedIframes(prev => prev.map(iframe =>
       iframe.id === id ? { ...iframe, htmlContent: newHtml } : iframe
     ));
     Analytics.track('iframe_updated', { iframeId: id, type: 'html' });
-  };
+    Analytics.track('asset_override_applied', { assetId: id, assetType: 'iframe_html' });
+  }, []);
 
   const translateImage = async (img: ImageAsset, targetLang: string) => {
     try {
       setTranslatingImages(prev => ({ ...prev, [img.id]: true }));
+      trackFirstAction('translate_image');
 
-      if (!aiClient) {
+      const client = await getAiClient(effectiveApiKey);
+      if (!client) {
         triggerToast('No API key set. Open Settings to add your Gemini API key.', 'warning');
         return;
       }
@@ -458,7 +619,7 @@ const App: React.FC = () => {
 
       const { data: base64Data, mimeType } = await urlToBase64(img.originalUrl);
 
-      const response = await aiClient.models.generateContent({
+      const response = await client.models.generateContent({
         model: 'gemini-2.0-flash',
         contents: {
           parts: [
@@ -505,15 +666,9 @@ const App: React.FC = () => {
 
   const downloadHtml = (lang: string, html: string) => {
     const blob = new Blob([html], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `index-${lang.toLowerCase()}.html`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    triggerToast(`Downloaded ${lang} file`, 'success');
+    saveBlobAsFile(blob, `index-${lang.toLowerCase()}.html`)
+      .then(() => triggerToast(`Downloaded ${lang} file`, 'success'))
+      .catch(() => triggerToast('Failed to download file', 'error'));
   };
 
   const copyToClipboard = (text: string) => {
@@ -537,7 +692,8 @@ const App: React.FC = () => {
     setTaskName(project.name);
     setActiveProjectId(project.id);
 
-    setActiveTab('monitor');
+    openTab('monitor');
+    Analytics.track('history_action', { action: 'load', projectId: project.id });
     triggerToast(`Loaded "${project.name}"`);
   };
 
@@ -548,7 +704,10 @@ const App: React.FC = () => {
       if (activeProjectId === id) setActiveProjectId(null);
       // Delete from hybrid DB (local + cloud)
       hybridDb.delete(id, user?.uid)
-        .then(() => triggerToast("Project deleted", 'success'))
+        .then(() => {
+          Analytics.track('history_action', { action: 'delete', projectId: id });
+          triggerToast("Project deleted", 'success');
+        })
         .catch((error) => {
           Analytics.track('history_delete_failed', {
             projectId: id,
@@ -568,7 +727,7 @@ const App: React.FC = () => {
       if (url.startsWith('data:')) {
         const fetchRes = await fetch(url);
         const blob = await fetchRes.blob();
-        saveAs(blob, filename || 'translated-image.png');
+        await saveBlobAsFile(blob, filename || 'translated-image.png');
         triggerToast("Download complete", 'success');
         return;
       }
@@ -577,7 +736,7 @@ const App: React.FC = () => {
       if (!response.ok) throw new Error('Network block');
       const blob = await response.blob();
       const name = filename || url.split('/').pop()?.split('?')[0] || 'image.png';
-      saveAs(blob, name);
+      await saveBlobAsFile(blob, name);
       triggerToast("Download complete", 'success');
     } catch (e) {
       console.warn("Direct download failed, opening in new tab", e);
@@ -598,7 +757,7 @@ const App: React.FC = () => {
     triggerToast("Packaging assets... this may take a moment");
 
     try {
-      const zip = new JSZip();
+      const zip = await createZip();
       const folder = zip.folder("assets");
       let successCount = 0;
 
@@ -647,7 +806,7 @@ const App: React.FC = () => {
       }
 
       const content = await zip.generateAsync({ type: "blob" });
-      saveAs(content, "lokalyze-assets.zip");
+      await saveBlobAsFile(content, "lokalyze-assets.zip");
       triggerToast(`Downloaded ${successCount} assets`, 'success');
 
     } catch (e: any) {
@@ -744,10 +903,11 @@ const App: React.FC = () => {
     });
 
     try {
-      if (!aiClient) {
+      const client = await getAiClient(effectiveApiKey);
+      if (!client) {
         throw new Error('No API key. Please open Settings and add your Gemini API key.');
       }
-      const stream = await aiClient.models.generateContentStream({
+      const stream = await client.models.generateContentStream({
         model: 'gemini-2.0-flash',
         contents: `SYSTEM: You are a strict HTML Localization Engine and Elite Copywriter.
 TASK: Translate the text content of the provided HTML into ${lang}.
@@ -837,11 +997,13 @@ ${preprocessedSource}`,
   }, [jobs, isBatchRunning, sourceHtml, activeProjectId, playNotificationSound]);
 
   const startBatch = () => {
+    trackFirstAction('start_batch');
+    Analytics.track('batch_clicked', { selectedCount: selectedLangs.length });
     if (selectedLangs.length === 0) return triggerToast("Select at least one language", 'warning');
     if (!sourceHtml.trim() || sourceHtml.length < 10) return triggerToast("Source HTML looks empty", 'warning');
 
     setIsBatchRunning(true);
-    setActiveTab('monitor');
+    openTab('monitor');
 
     const newProjectId = generateId();
     const finalTaskName = taskName.trim() || `Batch #${Date.now().toString().slice(-6)}`;
@@ -992,6 +1154,15 @@ ${preprocessedSource}`,
             </div>
             {uiFlags.shell ? (
               <Badge tone={syncModeLabel === 'Cloud Sync' ? 'info' : 'neutral'}>{syncModeLabel}</Badge>
+            ) : null}
+            {perfV1Enabled ? (
+              <div className="hidden lg:flex items-center gap-2 rounded-full border border-zinc-200 bg-zinc-100 px-3 py-1 text-[9px] font-mono text-zinc-500 dark:border-zinc-800 dark:bg-black/40 dark:text-zinc-300">
+                <span>JS {perfSnapshot.bundleBytes > 0 ? `${Math.round(perfSnapshot.bundleBytes / 1024)}kb` : '--'}</span>
+                <span>•</span>
+                <span>TTFA {perfSnapshot.initialRenderMs || 0}ms</span>
+                <span>•</span>
+                <span>Tab {perfSnapshot.tabSwitchMs || 0}ms</span>
+              </div>
             ) : null}
 
             <Tooltip content={soundEnabled ? "Mute Sounds" : "Enable Sounds"}>
@@ -1164,13 +1335,13 @@ ${preprocessedSource}`,
 
           {/* Dashboard Header / Tabs */}
           <div className="flex items-center gap-2 shrink-0 overflow-x-auto no-scrollbar pb-1">
-            <button onClick={() => setActiveTab('monitor')} className={`px-6 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all flex items-center gap-2 whitespace-nowrap ${activeTab === 'monitor' ? 'bg-white dark:bg-[#0e0e0e] border-zinc-200 dark:border-white/10 text-violet-500 shadow-xl' : 'border-transparent text-zinc-400 hover:text-zinc-600 hover:bg-white/50 dark:hover:bg-white/5'}`}>
+            <button onClick={() => openTab('monitor')} className={`px-6 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all flex items-center gap-2 whitespace-nowrap ${activeTab === 'monitor' ? 'bg-white dark:bg-[#0e0e0e] border-zinc-200 dark:border-white/10 text-violet-500 shadow-xl' : 'border-transparent text-zinc-400 hover:text-zinc-600 hover:bg-white/50 dark:hover:bg-white/5'}`}>
               <Icons.Cpu /> Live Monitor
             </button>
-            <button onClick={() => setActiveTab('assets')} className={`px-6 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all flex items-center gap-2 whitespace-nowrap ${activeTab === 'assets' ? 'bg-white dark:bg-[#0e0e0e] border-zinc-200 dark:border-white/10 text-violet-500 shadow-xl' : 'border-transparent text-zinc-400 hover:text-zinc-600 hover:bg-white/50 dark:hover:bg-white/5'}`}>
+            <button onClick={() => openTab('assets')} className={`px-6 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all flex items-center gap-2 whitespace-nowrap ${activeTab === 'assets' ? 'bg-white dark:bg-[#0e0e0e] border-zinc-200 dark:border-white/10 text-violet-500 shadow-xl' : 'border-transparent text-zinc-400 hover:text-zinc-600 hover:bg-white/50 dark:hover:bg-white/5'}`}>
               <Icons.Image /> Asset Manager <span className="ml-1 bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 px-1.5 py-0.5 rounded-md text-[9px]">{totalAssetsDetected}</span>
             </button>
-            <button onClick={() => setActiveTab('history')} className={`px-6 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all flex items-center gap-2 whitespace-nowrap ${activeTab === 'history' ? 'bg-white dark:bg-[#0e0e0e] border-zinc-200 dark:border-white/10 text-violet-500 shadow-xl' : 'border-transparent text-zinc-400 hover:text-zinc-600 hover:bg-white/50 dark:hover:bg-white/5'}`}>
+            <button onClick={() => openTab('history')} className={`px-6 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest border transition-all flex items-center gap-2 whitespace-nowrap ${activeTab === 'history' ? 'bg-white dark:bg-[#0e0e0e] border-zinc-200 dark:border-white/10 text-violet-500 shadow-xl' : 'border-transparent text-zinc-400 hover:text-zinc-600 hover:bg-white/50 dark:hover:bg-white/5'}`}>
               <Icons.History /> History <span className="ml-1 bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 px-1.5 py-0.5 rounded-md text-[9px]">{history.length}</span>
             </button>
           </div>
@@ -1243,10 +1414,10 @@ ${preprocessedSource}`,
                         </div>
                       )
                     )}
-                    {jobsList.map(job => (
+                    {visibleJobs.map(job => (
                       <div
                         key={job.id}
-                        onClick={() => setFocusedJobId(job.id)}
+                        onClick={() => openJobDetail(job.id)}
                         className={`group cursor-pointer rounded-2xl border transition-all hover:bg-white dark:hover:bg-white/5 hover:shadow-lg relative overflow-hidden ${monitorDensity === 'compact' ? 'p-2.5' : 'p-4'} ${focusedJobId === job.id ? 'bg-white dark:bg-violet-900/10 border-violet-500/50 ring-1 ring-violet-500/20 shadow-xl' : 'bg-white dark:bg-[#121212] border-zinc-200 dark:border-white/5'}`}
                       >
                         <div className={cn("flex justify-between items-center relative z-10", monitorDensity === 'compact' ? 'mb-2' : 'mb-3')}>
@@ -1295,6 +1466,14 @@ ${preprocessedSource}`,
                         </div>
                       </div>
                     ))}
+                    {virtualListsEnabled && visibleJobs.length < jobsList.length ? (
+                      <button
+                        onClick={() => setJobRenderLimit(prev => prev + 80)}
+                        className="lk-focus-visible w-full rounded-xl border border-dashed border-zinc-300 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                      >
+                        Load more jobs ({jobsList.length - visibleJobs.length} remaining)
+                      </button>
+                    ) : null}
                   </div>
                 </div>
 
@@ -1303,7 +1482,7 @@ ${preprocessedSource}`,
                   <div className="flex-1 flex flex-col h-full bg-zinc-50 dark:bg-[#0a0a0a] min-w-0">
                     <div className="p-4 border-b border-zinc-200 dark:border-white/5 flex justify-between items-center bg-white dark:bg-[#0e0e0e] shrink-0">
                       <div className="flex items-center gap-3">
-                        <button onClick={() => setFocusedJobId(null)} className="lg:hidden w-8 h-8 rounded-lg border border-zinc-200 dark:border-white/10 flex items-center justify-center text-zinc-500">←</button>
+                        <button onClick={closeJobDetail} className="lg:hidden w-8 h-8 rounded-lg border border-zinc-200 dark:border-white/10 flex items-center justify-center text-zinc-500">←</button>
                         <div>
                           <h2 className="text-xl font-black tracking-tighter flex items-center gap-3">
                             {jobs[focusedJobId].lang}
@@ -1320,7 +1499,7 @@ ${preprocessedSource}`,
                               </button>
                             </Tooltip>
                             <Tooltip content="Copy HTML">
-                              <button onClick={() => copyToClipboard(jobs[focusedJobId].translatedHtml)} className="h-9 px-3 rounded-lg bg-zinc-100 dark:bg-zinc-800 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors">
+                              <button aria-label="Copy translated HTML" onClick={() => copyToClipboard(jobs[focusedJobId].translatedHtml)} className="h-9 px-3 rounded-lg bg-zinc-100 dark:bg-zinc-800 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors">
                                 <Icons.Copy /> <span className="hidden sm:inline">Copy</span>
                               </button>
                             </Tooltip>
@@ -1333,7 +1512,7 @@ ${preprocessedSource}`,
                           </button>
                         </Tooltip>
                         <Tooltip content="Close Detail">
-                          <button onClick={() => setFocusedJobId(null)} className="hidden lg:flex w-9 h-9 rounded-lg border border-zinc-200 dark:border-white/10 items-center justify-center text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">
+                          <button onClick={closeJobDetail} className="hidden lg:flex w-9 h-9 rounded-lg border border-zinc-200 dark:border-white/10 items-center justify-center text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">
                             <Icons.Close />
                           </button>
                         </Tooltip>
@@ -1421,7 +1600,13 @@ ${preprocessedSource}`,
                   </div>
                 </div>
                 <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar">
-                  {history.length === 0 ? (
+                  {isHistoryLoading ? (
+                    <div className="space-y-3" aria-busy="true">
+                      <Skeleton variant="card" />
+                      <Skeleton variant="card" />
+                      <Skeleton variant="card" />
+                    </div>
+                  ) : history.length === 0 ? (
                     uiFlags.history ? (
                       <EmptyState
                         icon={<Icons.History />}
@@ -1436,7 +1621,7 @@ ${preprocessedSource}`,
                       </div>
                     )
                   ) : (
-                    (uiFlags.history ? sortedHistory : history).map((project) => (
+                    visibleHistory.map((project) => (
                       <div key={project.id} className={`flex flex-col md:flex-row items-center justify-between gap-6 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 group hover:border-violet-500/30 hover:shadow-lg transition-all ${activeProjectId === project.id ? 'ring-1 ring-violet-500/50 border-violet-500/30' : ''}`}>
                         <div className="flex items-center gap-4 w-full md:w-auto">
                           <div className={`w-12 h-12 rounded-2xl flex items-center justify-center text-lg ${activeProjectId === project.id ? 'bg-violet-500 text-white shadow-lg shadow-violet-500/30' : 'bg-zinc-100 dark:bg-white/5 text-zinc-400'}`}>
@@ -1467,6 +1652,7 @@ ${preprocessedSource}`,
                             <Icons.Refresh /> Load
                           </button>
                           <button
+                            aria-label={`Delete project ${project.name}`}
                             onClick={(e) => deleteProject(e, project.id)}
                             className="p-2 rounded-xl text-zinc-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
                           >
@@ -1476,6 +1662,14 @@ ${preprocessedSource}`,
                       </div>
                     ))
                   )}
+                  {virtualListsEnabled && visibleHistory.length < historyList.length ? (
+                    <button
+                      onClick={() => setHistoryRenderLimit(prev => prev + 80)}
+                      className="lk-focus-visible w-full rounded-xl border border-dashed border-zinc-300 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                    >
+                      Load more history ({historyList.length - visibleHistory.length} remaining)
+                    </button>
+                  ) : null}
                 </div>
               </div>
             ) : (
@@ -1515,7 +1709,7 @@ ${preprocessedSource}`,
                       <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-zinc-400">
                         <Icons.Globe /> <span>Detected Iframes / Widgets</span>
                       </div>
-                      {detectedIframes.map((iframe) => (
+                      {visibleDetectedIframes.map((iframe) => (
                         <div key={iframe.id} className="flex flex-col gap-4 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 border-l-4 border-l-indigo-500 group hover:border-indigo-500/30 hover:shadow-lg transition-all">
                           <div className="flex flex-col gap-2">
                             <label className="text-[9px] font-black uppercase tracking-widest text-zinc-400 flex items-center justify-between">
@@ -1524,7 +1718,7 @@ ${preprocessedSource}`,
                                 <Badge tone={iframe.htmlContent ? 'success' : iframe.replacementUrl ? 'info' : 'neutral'}>
                                   {iframe.htmlContent ? 'Deep' : iframe.replacementUrl ? 'Override' : 'Untouched'}
                                 </Badge>
-                                <button onClick={() => copyToClipboard(iframe.originalUrl)} className="text-zinc-400 hover:text-indigo-500">
+                                <button aria-label="Copy iframe source URL" onClick={() => copyToClipboard(iframe.originalUrl)} className="text-zinc-400 hover:text-indigo-500">
                                   <Icons.Copy />
                                 </button>
                               </div>
@@ -1628,6 +1822,14 @@ ${preprocessedSource}`,
 
                         </div>
                       ))}
+                      {virtualListsEnabled && visibleDetectedIframes.length < detectedIframes.length ? (
+                        <button
+                          onClick={() => setIframeRenderLimit(prev => prev + 40)}
+                          className="lk-focus-visible w-full rounded-xl border border-dashed border-zinc-300 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                        >
+                          Load more iframes ({detectedIframes.length - visibleDetectedIframes.length} remaining)
+                        </button>
+                      ) : null}
                     </div>
                   )}
 
@@ -1652,7 +1854,7 @@ ${preprocessedSource}`,
                         </div>
                       )
                     ) : (
-                      detectedImages.map((img) => (
+                      visibleDetectedImages.map((img) => (
                         <div key={img.id} className="flex flex-col md:flex-row gap-6 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 group hover:border-violet-500/30 hover:shadow-lg transition-all">
                           <div className="w-full md:w-32 h-32 rounded-2xl bg-zinc-100 dark:bg-black overflow-hidden border border-zinc-200 dark:border-white/10 shrink-0 relative">
                             <img src={img.originalUrl} alt="preview" className="w-full h-full object-cover" />
@@ -1668,12 +1870,12 @@ ${preprocessedSource}`,
                                     </Badge>
                                   ) : null}
                                   <Tooltip content="Download Original">
-                                    <button onClick={() => downloadAsset(img.originalUrl)} className="text-zinc-400 hover:text-violet-500 p-1">
+                                    <button aria-label="Download original image asset" onClick={() => downloadAsset(img.originalUrl)} className="text-zinc-400 hover:text-violet-500 p-1">
                                       <Icons.Download />
                                     </button>
                                   </Tooltip>
                                   <Tooltip content="Copy URL">
-                                    <button onClick={() => copyToClipboard(img.originalUrl)} className="text-zinc-400 hover:text-violet-500 p-1">
+                                    <button aria-label="Copy original image URL" onClick={() => copyToClipboard(img.originalUrl)} className="text-zinc-400 hover:text-violet-500 p-1">
                                       <Icons.Copy />
                                     </button>
                                   </Tooltip>
@@ -1717,7 +1919,7 @@ ${preprocessedSource}`,
                                 {img.replacementUrl && (
                                   <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
                                     <Tooltip content="Download Replacement">
-                                      <button onClick={() => downloadAsset(img.replacementUrl, `translated-asset-${img.id}.png`)} className="text-zinc-400 hover:text-emerald-500">
+                                      <button aria-label="Download replacement image asset" onClick={() => downloadAsset(img.replacementUrl, `translated-asset-${img.id}.png`)} className="text-zinc-400 hover:text-emerald-500">
                                         <Icons.Download />
                                       </button>
                                     </Tooltip>
@@ -1730,6 +1932,14 @@ ${preprocessedSource}`,
                         </div>
                       ))
                     )}
+                    {virtualListsEnabled && visibleDetectedImages.length < detectedImages.length ? (
+                      <button
+                        onClick={() => setImageRenderLimit(prev => prev + 60)}
+                        className="lk-focus-visible w-full rounded-xl border border-dashed border-zinc-300 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                      >
+                        Load more images ({detectedImages.length - visibleDetectedImages.length} remaining)
+                      </button>
+                    ) : null}
                   </div>
                 </div>
               </div>

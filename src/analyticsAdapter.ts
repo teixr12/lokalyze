@@ -1,4 +1,5 @@
 import type { AnalyticsEventName } from './analyticsTypes';
+import type { AnalyticsDeliveryResult } from './apiTypes';
 
 type AnalyticsProps = Record<string, unknown>;
 
@@ -9,6 +10,11 @@ interface AnalyticsProvider {
     page: (route: string, props?: AnalyticsProps) => void | Promise<void>;
 }
 
+interface AnalyticsProviderEntry {
+    name: AnalyticsDeliveryResult['provider'];
+    provider: AnalyticsProvider;
+}
+
 interface AnalyticsWindow extends Window {
     __lokalyzeAnalytics?: {
         track?: (event: string, props?: AnalyticsProps) => void;
@@ -16,6 +22,7 @@ interface AnalyticsWindow extends Window {
         group?: (groupId: string, traits?: AnalyticsProps) => void;
         page?: (route: string, props?: AnalyticsProps) => void;
     };
+    __lokalyzeAnalyticsDelivery?: AnalyticsDeliveryResult[];
 }
 
 const toBool = (value: string | undefined, fallback = false): boolean => {
@@ -23,11 +30,13 @@ const toBool = (value: string | undefined, fallback = false): boolean => {
     return value === '1' || value.toLowerCase() === 'true';
 };
 
-const callSafely = async (fn: () => void | Promise<void>) => {
+const callSafely = async (fn: () => void | Promise<void>): Promise<boolean> => {
     try {
         await fn();
+        return true;
     } catch {
         // Never break app flow due to analytics provider failures.
+        return false;
     }
 };
 
@@ -107,18 +116,35 @@ const createPosthogProvider = (): AnalyticsProvider | null => {
     };
 };
 
-const providers: AnalyticsProvider[] = (() => {
-    const list: AnalyticsProvider[] = [createInternalProvider()];
+const providers: AnalyticsProviderEntry[] = (() => {
+    const list: AnalyticsProviderEntry[] = [{ name: 'internal', provider: createInternalProvider() }];
     const posthogProvider = createPosthogProvider();
-    if (posthogProvider) list.push(posthogProvider);
+    if (posthogProvider) list.push({ name: 'posthog', provider: posthogProvider });
     return list;
 })();
+
+const recordDeliveryResults = (results: AnalyticsDeliveryResult[]) => {
+    const hook = (window as AnalyticsWindow).__lokalyzeAnalyticsDelivery;
+    if (Array.isArray(hook)) {
+        hook.push(...results);
+        if (hook.length > 200) {
+            hook.splice(0, hook.length - 200);
+        }
+        return;
+    }
+
+    (window as AnalyticsWindow).__lokalyzeAnalyticsDelivery = [...results];
+};
 
 const fanOut = async (
     method: keyof AnalyticsProvider,
     ...args: [string, AnalyticsProps?]
 ) => {
-    await Promise.all(providers.map((provider) => callSafely(() => provider[method](args[0], args[1]))));
+    const results = await Promise.all(providers.map(async ({ name, provider }) => {
+        const ok = await callSafely(() => provider[method](args[0], args[1]));
+        return { provider: name, ok, event: args[0] } as AnalyticsDeliveryResult;
+    }));
+    recordDeliveryResults(results);
 };
 
 export const analyticsAdapter = {

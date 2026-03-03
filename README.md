@@ -82,6 +82,27 @@ create policy "Users manage own projects"
 >
 > If you need strict per-user security, add a trusted backend/Edge Function that validates Firebase ID tokens and proxies or signs Supabase requests.
 
+### 3.1 Secure Proxy Mode (Recommended for production)
+
+This repository includes `/api/projects` proxy endpoints for server-side tenant isolation.
+
+Set:
+
+```bash
+VITE_DATA_PROVIDER=proxy
+VITE_PROXY_PROJECTS_URL=/api/projects
+SUPABASE_SERVICE_ROLE_KEY=...
+FIREBASE_ADMIN_PROJECT_ID=...
+FIREBASE_ADMIN_CLIENT_EMAIL=...
+FIREBASE_ADMIN_PRIVATE_KEY=...   # keep \n escaped in env dashboards
+```
+
+Behavior:
+- Frontend continues saving to IndexedDB for offline support.
+- Cloud reads/writes go through `/api/projects` with Firebase ID token verification.
+- Scope is enforced server-side by `user_id`.
+- Rollback is one variable: `VITE_DATA_PROVIDER=client`.
+
 ### 4. Run Dev Server
 
 ```bash

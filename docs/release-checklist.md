@@ -15,8 +15,16 @@
   - `VITE_UI_V2_HISTORY`
   - `VITE_UI_PERF_V1`
   - `VITE_UI_V2_VIRTUAL_LISTS`
+  - `VITE_DATA_PROVIDER` (`client` or `proxy`)
+  - `VITE_DATA_PROVIDER_FALLBACK_CLIENT`
+  - `VITE_ANALYTICS_EXTERNAL_V1`
 - [ ] `VITE_DISABLE_FIREBASE_AUTH` is not set in production (test-only variable).
 - [ ] No unresolved blocker in critical flows: auth, batch, monitor, assets, history, settings.
+- [ ] If `VITE_DATA_PROVIDER=proxy`, proxy credentials are configured:
+  - `SUPABASE_SERVICE_ROLE_KEY`
+  - `FIREBASE_ADMIN_PROJECT_ID`
+  - `FIREBASE_ADMIN_CLIENT_EMAIL`
+  - `FIREBASE_ADMIN_PRIVATE_KEY`
 
 ## 2) Deploy
 - [ ] Deploy production to `teixr12s-projects/lokalyze-maynfrme`.
@@ -30,6 +38,7 @@
 - [ ] Core tabs render (`workspace smoke` profile) or auth gate appears correctly (`public smoke` profile).
 - [ ] If auth gate appears, sign-in button is visible and actionable.
 - [ ] Deploy hygiene executed (keep last 2 production deployments).
+- [ ] If proxy mode is enabled, cloud history CRUD works for account A and is isolated from account B.
 
 ## 4) Rollback Triggers
 - [ ] Any core smoke check fails.
@@ -38,6 +47,7 @@
 
 ## 5) Immediate Rollback Actions
 - [ ] Set `VITE_UI_V2_ENABLED=false` and redeploy.
+- [ ] Or switch data provider to client fallback: `VITE_DATA_PROVIDER=client`.
 - [ ] Or set module-specific fallback:
   - `VITE_UI_V2_MONITOR=false`
   - `VITE_UI_V2_ASSETS=false`

@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import type { GenerateContentResponse } from "@google/genai";
 const Editor = lazy(() => import('@monaco-editor/react'));
 import { User } from 'firebase/auth';
-import { auth, signInWithPopup, googleProvider, signOut, onAuthStateChanged, isConfigured as isFirebaseConfigured } from './src/firebase';
+import { auth, signInWithPopup, signInWithRedirect, getRedirectResult, googleProvider, signOut, onAuthStateChanged, isConfigured as isFirebaseConfigured } from './src/firebase';
 
 // Modular Imports
 import { LANGUAGES, MAX_CONCURRENT_JOBS, KEYS } from './src/constants';
@@ -118,6 +118,40 @@ const toLatencyBucket = (ms: number): string => {
   return 'gte_1000ms';
 };
 
+const POPUP_FALLBACK_CODES = new Set([
+  'auth/popup-blocked',
+  'auth/popup-closed-by-user',
+  'auth/cancelled-popup-request',
+  'auth/operation-not-supported-in-this-environment',
+]);
+
+const isLikelySafariOrIos = (): boolean => {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  const iOS = /iPhone|iPad|iPod/i.test(ua);
+  const safariDesktop = /Safari/i.test(ua) && !/Chrome|CriOS|Chromium|Edg|OPR|Firefox/i.test(ua);
+  return iOS || safariDesktop;
+};
+
+const formatAuthErrorMessage = (code: string, message: string): string => {
+  if (code === 'auth/unauthorized-domain') {
+    return 'Login failed: unauthorized domain in Firebase Auth.';
+  }
+  if (code === 'auth/operation-not-allowed') {
+    return 'Login failed: Google provider is disabled in Firebase Auth.';
+  }
+  if (code === 'auth/web-storage-unsupported') {
+    return 'Login failed: browser storage/cookies are blocked.';
+  }
+  if (code === 'auth/network-request-failed') {
+    return 'Login failed: network request failed. Check connection and retry.';
+  }
+  if (code === 'auth/invalid-api-key') {
+    return 'Login failed: invalid Firebase API key.';
+  }
+  return `Login failed: ${message}${code ? ` (${code})` : ''}`;
+};
+
 // --- APP COMPONENT ---
 const App: React.FC = () => {
   // -- STATE: PERSISTENCE LAYER (PHASE A) --
@@ -138,6 +172,7 @@ const App: React.FC = () => {
   const firstActionTrackedRef = useRef(false);
   const tabSwitchStartRef = useRef<number | null>(null);
   const jobDetailOpenStartRef = useRef<Record<string, number>>({});
+  const redirectResultCheckedRef = useRef(false);
   const [perfSnapshot, setPerfSnapshot] = useState<PerfBudgetSnapshot>({
     bundleBytes: 0,
     initialRenderMs: 0,
@@ -177,6 +212,26 @@ const App: React.FC = () => {
   }, [user?.uid, user?.email]);
 
   useEffect(() => {
+    if (!isFirebaseConfigured || !auth || redirectResultCheckedRef.current) return;
+    redirectResultCheckedRef.current = true;
+
+    void (async () => {
+      try {
+        await getRedirectResult(auth);
+      } catch (error: any) {
+        const code = String(error?.code || '');
+        const message = String(error?.message || 'Unknown redirect login error');
+        Analytics.track('api_error', {
+          source: 'auth_redirect_result',
+          error: message,
+          code,
+        });
+        triggerToast(formatAuthErrorMessage(code, message), 'error');
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
     const onGlobalError = (event: ErrorEvent) => {
       Analytics.track('client_error', {
         source: 'window.onerror',
@@ -211,14 +266,60 @@ const App: React.FC = () => {
 
   const handleLogin = async () => {
     if (!auth) return triggerToast("Firebase is not configured. Check .env.example", 'warning');
+
+    if (isLikelySafariOrIos()) {
+      try {
+        await signInWithRedirect(auth, googleProvider);
+        return;
+      } catch (error: any) {
+        const code = String(error?.code || '');
+        const message = String(error?.message || 'Unknown login error');
+        Analytics.track('api_error', {
+          source: 'auth_login_redirect_first',
+          error: message,
+          code,
+        });
+        triggerToast(formatAuthErrorMessage(code, message), 'error');
+        return;
+      }
+    }
+
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error: any) {
+      const code = String(error?.code || '');
+      const message = String(error?.message || 'Unknown login error');
+
+      const shouldFallbackToRedirect = POPUP_FALLBACK_CODES.has(code);
+
+      if (shouldFallbackToRedirect) {
+        try {
+          triggerToast('Popup unavailable. Redirecting to Google sign-in...', 'info');
+          await signInWithRedirect(auth, googleProvider);
+          return;
+        } catch (redirectError: any) {
+          Analytics.track('api_error', {
+            source: 'auth_login_redirect',
+            error: redirectError?.message || 'unknown_redirect_error',
+            code: redirectError?.code || '',
+          });
+          triggerToast(
+            formatAuthErrorMessage(
+              String(redirectError?.code || ''),
+              String(redirectError?.message || 'redirect error'),
+            ),
+            'error',
+          );
+          return;
+        }
+      }
+
       Analytics.track('api_error', {
         source: 'auth_login',
-        error: error?.message || 'unknown_login_error',
+        error: message || 'unknown_login_error',
+        code,
       });
-      triggerToast(`Login failed: ${error.message}`, 'error');
+      triggerToast(formatAuthErrorMessage(code, message), 'error');
     }
   };
 

@@ -26,6 +26,7 @@ import { EmptyState } from './src/design-system/components/EmptyState';
 import { InlineMessage } from './src/design-system/components/InlineMessage';
 import { Button } from './src/design-system/components/Button';
 import { Skeleton } from './src/design-system/components/Skeleton';
+import { ConfirmModal } from './src/design-system/components/ConfirmModal';
 
 // --- ERROR BOUNDARY ---
 interface ErrorBoundaryState { hasError: boolean; error: Error | null; }
@@ -94,6 +95,29 @@ const createZip = async () => {
   return new JSZipCtor();
 };
 
+const LOCAL_TENANT_KEY = 'lokalyze_local_tenant_id';
+
+const getLocalTenantId = (): string => {
+  if (typeof window === 'undefined') return 'local_anon';
+  try {
+    const existing = localStorage.getItem(LOCAL_TENANT_KEY);
+    if (existing) return existing;
+    const generated = `local_${Math.random().toString(36).slice(2, 10)}`;
+    localStorage.setItem(LOCAL_TENANT_KEY, generated);
+    return generated;
+  } catch {
+    return 'local_anon';
+  }
+};
+
+const toLatencyBucket = (ms: number): string => {
+  if (ms < 100) return 'lt_100ms';
+  if (ms < 250) return '100_249ms';
+  if (ms < 500) return '250_499ms';
+  if (ms < 1000) return '500_999ms';
+  return 'gte_1000ms';
+};
+
 // --- APP COMPONENT ---
 const App: React.FC = () => {
   // -- STATE: PERSISTENCE LAYER (PHASE A) --
@@ -126,6 +150,15 @@ const App: React.FC = () => {
   useEffect(() => {
     if (isFirebaseConfigured && auth) {
       const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+        const previousUserId = authUserRef.current;
+        const nextUserId = currentUser?.uid || null;
+        if (!previousUserId && nextUserId) {
+          Analytics.track('login', { method: 'google', userId: nextUserId });
+        }
+        if (previousUserId && !nextUserId) {
+          Analytics.track('logout', { method: 'google', userId: previousUserId });
+        }
+        authUserRef.current = nextUserId;
         setUser(currentUser);
         setAuthLoading(false);
       });
@@ -181,13 +214,25 @@ const App: React.FC = () => {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error: any) {
+      Analytics.track('api_error', {
+        source: 'auth_login',
+        error: error?.message || 'unknown_login_error',
+      });
       triggerToast(`Login failed: ${error.message}`, 'error');
     }
   };
 
   const handleLogout = async () => {
     if (!auth) return;
-    await signOut(auth);
+    try {
+      await signOut(auth);
+    } catch (error: any) {
+      Analytics.track('api_error', {
+        source: 'auth_logout',
+        error: error?.message || 'unknown_logout_error',
+      });
+      triggerToast('Logout failed. Try again.', 'error');
+    }
   };
 
   const saveSettings = (key: string) => {
@@ -258,9 +303,41 @@ const App: React.FC = () => {
   const [historyRenderLimit, setHistoryRenderLimit] = useState(80);
   const [imageRenderLimit, setImageRenderLimit] = useState(60);
   const [iframeRenderLimit, setIframeRenderLimit] = useState(40);
+  const [pendingHistoryDelete, setPendingHistoryDelete] = useState<{ id: string; name: string } | null>(null);
+  const [isDeletingProject, setIsDeletingProject] = useState(false);
+  const [historyDeleteError, setHistoryDeleteError] = useState<{ id: string; name: string; message: string } | null>(null);
+  const [assetInlineError, setAssetInlineError] = useState<string | null>(null);
+  const [assetRetryContext, setAssetRetryContext] = useState<
+    | { type: 'download_all' }
+    | { type: 'translate_image'; imageId: string; targetLang: string }
+    | null
+  >(null);
 
   // References for processing loop
   const processingRefs = useRef<Set<string>>(new Set());
+  const authUserRef = useRef<string | null>(null);
+  const firstValueProjectRef = useRef<Set<string>>(new Set());
+  const lastPageRouteRef = useRef<string>('');
+  const localTenantId = useMemo(() => getLocalTenantId(), []);
+
+  useEffect(() => {
+    if (authLoading) return;
+    Analytics.group(user?.uid || localTenantId, {
+      mode: user?.uid ? 'authenticated' : 'anonymous',
+      source: user?.uid ? 'firebase_auth' : 'local_only',
+    });
+  }, [authLoading, user?.uid, localTenantId]);
+
+  useEffect(() => {
+    if (authLoading) return;
+    const route = isFirebaseConfigured && !user ? '/auth' : `/workspace/${activeTab}`;
+    if (lastPageRouteRef.current === route) return;
+    lastPageRouteRef.current = route;
+    Analytics.page(route, {
+      tab: activeTab,
+      authenticated: Boolean(user?.uid),
+    });
+  }, [authLoading, activeTab, user?.uid]);
 
   const trackFirstAction = useCallback((action: string) => {
     if (!perfV1Enabled || firstActionTrackedRef.current) return;
@@ -353,6 +430,7 @@ const App: React.FC = () => {
       frame2 = requestAnimationFrame(() => {
         const elapsed = Math.max(0, Math.round(performance.now() - startedAt));
         Analytics.track('tab_switch_latency', { panel: activeTab, ms: elapsed });
+        Analytics.track('latency_bucket', { source: 'tab_switch', bucket: toLatencyBucket(elapsed), ms: elapsed });
         setPerfSnapshot(prev => ({ ...prev, tabSwitchMs: elapsed }));
         tabSwitchStartRef.current = null;
       });
@@ -371,10 +449,24 @@ const App: React.FC = () => {
     const frame = requestAnimationFrame(() => {
       const elapsed = Math.max(0, Math.round(performance.now() - startedAt));
       Analytics.track('job_detail_open_latency', { jobId: focusedJobId, ms: elapsed });
+      Analytics.track('latency_bucket', { source: 'job_detail_open', bucket: toLatencyBucket(elapsed), ms: elapsed });
       delete jobDetailOpenStartRef.current[focusedJobId];
     });
     return () => cancelAnimationFrame(frame);
   }, [focusedJobId, perfV1Enabled]);
+
+  useEffect(() => {
+    if (!activeProjectId) return;
+    if (firstValueProjectRef.current.has(activeProjectId)) return;
+    const firstCompletedJob = (Object.values(jobs) as TranslationJob[]).find(job => job.status === 'completed');
+    if (!firstCompletedJob) return;
+    firstValueProjectRef.current.add(activeProjectId);
+    Analytics.track('first_value_action', {
+      projectId: activeProjectId,
+      jobId: firstCompletedJob.id,
+      lang: firstCompletedJob.lang,
+    });
+  }, [jobs, activeProjectId]);
 
   // SAVE ACTIVE PROJECT GRANULARLY (Debounced — avoids writing on every streaming progress tick)
   useEffect(() => {
@@ -607,6 +699,8 @@ const App: React.FC = () => {
   const translateImage = async (img: ImageAsset, targetLang: string) => {
     try {
       setTranslatingImages(prev => ({ ...prev, [img.id]: true }));
+      setAssetInlineError(null);
+      setAssetRetryContext(null);
       trackFirstAction('translate_image');
 
       const client = await getAiClient(effectiveApiKey);
@@ -658,7 +752,10 @@ const App: React.FC = () => {
 
     } catch (e: any) {
       console.error(e);
-      triggerToast(e.message || "Image translation failed (CORS or Model Error)", 'error');
+      const message = e?.message || "Image translation failed (CORS or Model Error)";
+      setAssetInlineError(`Image translation failed for ${img.originalUrl}: ${message}`);
+      setAssetRetryContext({ type: 'translate_image', imageId: img.id, targetLang });
+      triggerToast(message, 'error');
     } finally {
       setTranslatingImages(prev => ({ ...prev, [img.id]: false }));
     }
@@ -668,12 +765,26 @@ const App: React.FC = () => {
     const blob = new Blob([html], { type: 'text/html' });
     saveBlobAsFile(blob, `index-${lang.toLowerCase()}.html`)
       .then(() => triggerToast(`Downloaded ${lang} file`, 'success'))
-      .catch(() => triggerToast('Failed to download file', 'error'));
+      .catch((error) => {
+        Analytics.track('asset_download_failed', {
+          source: 'downloadHtml',
+          lang,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        triggerToast('Failed to download file', 'error');
+      });
   };
 
   const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    triggerToast("Copied to clipboard", 'success');
+    navigator.clipboard.writeText(text)
+      .then(() => triggerToast("Copied to clipboard", 'success'))
+      .catch((error) => {
+        Analytics.track('api_error', {
+          source: 'clipboard_write',
+          error: error instanceof Error ? error.message : String(error),
+        });
+        triggerToast('Copy failed', 'error');
+      });
   };
 
   const loadProject = (project: Project) => {
@@ -697,24 +808,39 @@ const App: React.FC = () => {
     triggerToast(`Loaded "${project.name}"`);
   };
 
-  const deleteProject = (e: React.MouseEvent, id: string) => {
-    e.stopPropagation(); // Prevent loading when clicking delete
-    if (confirm("Are you sure you want to delete this project history?")) {
-      setHistory(prev => prev.filter(p => p.id !== id));
-      if (activeProjectId === id) setActiveProjectId(null);
-      // Delete from hybrid DB (local + cloud)
-      hybridDb.delete(id, user?.uid)
-        .then(() => {
-          Analytics.track('history_action', { action: 'delete', projectId: id });
-          triggerToast("Project deleted", 'success');
-        })
-        .catch((error) => {
-          Analytics.track('history_delete_failed', {
-            projectId: id,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          triggerToast("Failed to delete project", 'error');
-        });
+  const requestDeleteProject = (e: React.MouseEvent, id: string, name: string) => {
+    e.stopPropagation();
+    setHistoryDeleteError(null);
+    setPendingHistoryDelete({ id, name });
+  };
+
+  const confirmDeleteProject = async () => {
+    if (!pendingHistoryDelete) return;
+    setIsDeletingProject(true);
+    setHistoryDeleteError(null);
+
+    const targetProjectId = pendingHistoryDelete.id;
+    const targetProjectName = pendingHistoryDelete.name;
+
+    try {
+      await hybridDb.delete(targetProjectId, user?.uid);
+      setHistory(prev => prev.filter(p => p.id !== targetProjectId));
+      if (activeProjectId === targetProjectId) {
+        setActiveProjectId(null);
+      }
+      Analytics.track('history_action', { action: 'delete', projectId: targetProjectId });
+      triggerToast("Project deleted", 'success');
+      setPendingHistoryDelete(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      Analytics.track('history_delete_failed', {
+        projectId: targetProjectId,
+        error: message,
+      });
+      setHistoryDeleteError({ id: targetProjectId, name: targetProjectName, message });
+      triggerToast("Failed to delete project", 'error');
+    } finally {
+      setIsDeletingProject(false);
     }
   };
 
@@ -754,6 +880,8 @@ const App: React.FC = () => {
   const downloadAllAssets = async () => {
     if (detectedImages.length === 0) return triggerToast("No assets to download", 'warning');
     setIsDownloadingAssets(true);
+    setAssetInlineError(null);
+    setAssetRetryContext(null);
     triggerToast("Packaging assets... this may take a moment");
 
     try {
@@ -808,6 +936,8 @@ const App: React.FC = () => {
       const content = await zip.generateAsync({ type: "blob" });
       await saveBlobAsFile(content, "lokalyze-assets.zip");
       triggerToast(`Downloaded ${successCount} assets`, 'success');
+      setAssetInlineError(null);
+      setAssetRetryContext(null);
 
     } catch (e: any) {
       console.error(e);
@@ -815,10 +945,29 @@ const App: React.FC = () => {
         source: 'downloadAllAssets',
         error: e?.message || String(e),
       });
-      triggerToast(e.message || "Batch download failed", 'error');
+      const message = e?.message || "Batch download failed";
+      setAssetInlineError(`Asset package failed: ${message}`);
+      setAssetRetryContext({ type: 'download_all' });
+      triggerToast(message, 'error');
     } finally {
       setIsDownloadingAssets(false);
     }
+  };
+
+  const retryLastAssetAction = () => {
+    if (!assetRetryContext) return;
+    if (assetRetryContext.type === 'download_all') {
+      void downloadAllAssets();
+      return;
+    }
+
+    const image = detectedImages.find(item => item.id === assetRetryContext.imageId);
+    if (!image) {
+      setAssetInlineError('Unable to retry image translation because the asset was removed.');
+      setAssetRetryContext(null);
+      return;
+    }
+    void translateImage(image, assetRetryContext.targetLang);
   };
 
   const stopJob = (jobId: string) => {
@@ -1128,6 +1277,22 @@ ${preprocessedSource}`,
         v2Enabled={uiFlags.settings}
       />
 
+      <ConfirmModal
+        isOpen={Boolean(pendingHistoryDelete)}
+        title="Delete Project History"
+        description={pendingHistoryDelete
+          ? `Delete "${pendingHistoryDelete.name}" from history? This cannot be undone.`
+          : 'Delete this project from history?'}
+        confirmLabel="Delete Project"
+        cancelLabel="Keep Project"
+        loading={isDeletingProject}
+        onConfirm={() => { void confirmDeleteProject(); }}
+        onCancel={() => {
+          if (isDeletingProject) return;
+          setPendingHistoryDelete(null);
+        }}
+      />
+
       {/* Toast Notification */}
       {notification && (
         <div className={cn("fixed top-6 right-6 z-50 animate-[slideIn_0.3s_ease-out] flex items-center gap-3 px-5 py-3 rounded-xl shadow-2xl shadow-black/20 border", toastVariantStyles[notification.type])}>
@@ -1418,6 +1583,7 @@ ${preprocessedSource}`,
                       <div
                         key={job.id}
                         onClick={() => openJobDetail(job.id)}
+                        style={virtualListsEnabled ? { contentVisibility: 'auto', containIntrinsicSize: monitorDensity === 'compact' ? '84px' : '102px' } : undefined}
                         className={`group cursor-pointer rounded-2xl border transition-all hover:bg-white dark:hover:bg-white/5 hover:shadow-lg relative overflow-hidden ${monitorDensity === 'compact' ? 'p-2.5' : 'p-4'} ${focusedJobId === job.id ? 'bg-white dark:bg-violet-900/10 border-violet-500/50 ring-1 ring-violet-500/20 shadow-xl' : 'bg-white dark:bg-[#121212] border-zinc-200 dark:border-white/5'}`}
                       >
                         <div className={cn("flex justify-between items-center relative z-10", monitorDensity === 'compact' ? 'mb-2' : 'mb-3')}>
@@ -1600,6 +1766,20 @@ ${preprocessedSource}`,
                   </div>
                 </div>
                 <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar">
+                  {historyDeleteError ? (
+                    <InlineMessage tone="error">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span>Failed to delete "{historyDeleteError.name}": {historyDeleteError.message}</span>
+                        <Button
+                          variant="secondary"
+                          onClick={() => setPendingHistoryDelete({ id: historyDeleteError.id, name: historyDeleteError.name })}
+                          disabled={isDeletingProject}
+                        >
+                          Retry Delete
+                        </Button>
+                      </div>
+                    </InlineMessage>
+                  ) : null}
                   {isHistoryLoading ? (
                     <div className="space-y-3" aria-busy="true">
                       <Skeleton variant="card" />
@@ -1622,7 +1802,11 @@ ${preprocessedSource}`,
                     )
                   ) : (
                     visibleHistory.map((project) => (
-                      <div key={project.id} className={`flex flex-col md:flex-row items-center justify-between gap-6 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 group hover:border-violet-500/30 hover:shadow-lg transition-all ${activeProjectId === project.id ? 'ring-1 ring-violet-500/50 border-violet-500/30' : ''}`}>
+                      <div
+                        key={project.id}
+                        style={virtualListsEnabled ? { contentVisibility: 'auto', containIntrinsicSize: '156px' } : undefined}
+                        className={`flex flex-col md:flex-row items-center justify-between gap-6 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 group hover:border-violet-500/30 hover:shadow-lg transition-all ${activeProjectId === project.id ? 'ring-1 ring-violet-500/50 border-violet-500/30' : ''}`}
+                      >
                         <div className="flex items-center gap-4 w-full md:w-auto">
                           <div className={`w-12 h-12 rounded-2xl flex items-center justify-center text-lg ${activeProjectId === project.id ? 'bg-violet-500 text-white shadow-lg shadow-violet-500/30' : 'bg-zinc-100 dark:bg-white/5 text-zinc-400'}`}>
                             {activeProjectId === project.id ? <span className="animate-pulse">●</span> : <Icons.History />}
@@ -1653,8 +1837,9 @@ ${preprocessedSource}`,
                           </button>
                           <button
                             aria-label={`Delete project ${project.name}`}
-                            onClick={(e) => deleteProject(e, project.id)}
-                            className="p-2 rounded-xl text-zinc-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+                            onClick={(e) => requestDeleteProject(e, project.id, project.name)}
+                            disabled={isDeletingProject}
+                            className="p-2 rounded-xl text-zinc-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors disabled:opacity-50"
                           >
                             <Icons.Trash />
                           </button>
@@ -1695,6 +1880,18 @@ ${preprocessedSource}`,
                   </div>
                 </div>
                 <div className="flex-1 overflow-y-auto p-6 space-y-8 custom-scrollbar">
+                  {assetInlineError ? (
+                    <InlineMessage tone="error">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span>{assetInlineError}</span>
+                        {assetRetryContext ? (
+                          <Button variant="secondary" onClick={retryLastAssetAction} disabled={isDownloadingAssets}>
+                            Retry
+                          </Button>
+                        ) : null}
+                      </div>
+                    </InlineMessage>
+                  ) : null}
                   {uiFlags.assets && detectedImages.length === 0 && detectedIframes.length === 0 ? (
                     <EmptyState
                       icon={<Icons.Image />}
@@ -1710,7 +1907,11 @@ ${preprocessedSource}`,
                         <Icons.Globe /> <span>Detected Iframes / Widgets</span>
                       </div>
                       {visibleDetectedIframes.map((iframe) => (
-                        <div key={iframe.id} className="flex flex-col gap-4 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 border-l-4 border-l-indigo-500 group hover:border-indigo-500/30 hover:shadow-lg transition-all">
+                        <div
+                          key={iframe.id}
+                          style={virtualListsEnabled ? { contentVisibility: 'auto', containIntrinsicSize: '300px' } : undefined}
+                          className="flex flex-col gap-4 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 border-l-4 border-l-indigo-500 group hover:border-indigo-500/30 hover:shadow-lg transition-all"
+                        >
                           <div className="flex flex-col gap-2">
                             <label className="text-[9px] font-black uppercase tracking-widest text-zinc-400 flex items-center justify-between">
                               <span>Original Frame Source</span>
@@ -1855,7 +2056,11 @@ ${preprocessedSource}`,
                       )
                     ) : (
                       visibleDetectedImages.map((img) => (
-                        <div key={img.id} className="flex flex-col md:flex-row gap-6 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 group hover:border-violet-500/30 hover:shadow-lg transition-all">
+                        <div
+                          key={img.id}
+                          style={virtualListsEnabled ? { contentVisibility: 'auto', containIntrinsicSize: '280px' } : undefined}
+                          className="flex flex-col md:flex-row gap-6 p-6 bg-white dark:bg-[#121212] rounded-3xl border border-zinc-200 dark:border-white/5 group hover:border-violet-500/30 hover:shadow-lg transition-all"
+                        >
                           <div className="w-full md:w-32 h-32 rounded-2xl bg-zinc-100 dark:bg-black overflow-hidden border border-zinc-200 dark:border-white/10 shrink-0 relative">
                             <img src={img.originalUrl} alt="preview" className="w-full h-full object-cover" />
                           </div>

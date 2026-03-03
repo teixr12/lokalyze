@@ -1,4 +1,5 @@
 import type { AnalyticsEventName } from './analyticsTypes';
+import { analyticsAdapter } from './analyticsAdapter';
 
 // --- UTILS ---
 
@@ -58,8 +59,11 @@ const EVENT_REQUIRED_KEYS: Partial<Record<AnalyticsEventName, string[]>> = {
     batch_clicked: ['selectedCount'],
     panel_opened: ['panel'],
     history_action: ['action'],
+    first_value_action: ['projectId', 'jobId'],
     time_to_first_action: ['action', 'ms'],
     tab_switch_latency: ['panel', 'ms'],
+    api_error: ['source', 'error'],
+    latency_bucket: ['source', 'bucket'],
     asset_download_failed: ['source', 'error'],
     history_delete_failed: ['projectId', 'error'],
     client_error: ['source', 'message'],
@@ -86,10 +90,7 @@ export const Analytics = {
         }
 
         try {
-            const hook = (window as any).__lokalyzeAnalytics;
-            if (hook?.track) {
-                hook.track(eventName, safeProps);
-            }
+            analyticsAdapter.track(eventName, safeProps);
         } catch {
             // Fail-safe analytics: never break UI flow.
         }
@@ -101,10 +102,7 @@ export const Analytics = {
     identify: (userId: string, traits: Record<string, unknown> = {}) => {
         if (!userId) return;
         try {
-            const hook = (window as any).__lokalyzeAnalytics;
-            if (hook?.identify) {
-                hook.identify(userId, traits);
-            }
+            analyticsAdapter.identify(userId, traits);
         } catch {
             // Fail-safe analytics: never break UI flow.
         }
@@ -112,5 +110,21 @@ export const Analytics = {
         if (import.meta.env.DEV) {
             console.debug('[Analytics] identify', { userId, ...traits });
         }
-    }
+    },
+    group: (groupId: string, traits: Record<string, unknown> = {}) => {
+        if (!groupId) return;
+        try {
+            analyticsAdapter.group(groupId, traits);
+        } catch {
+            // Fail-safe analytics: never break UI flow.
+        }
+    },
+    page: (route: string, props: Record<string, unknown> = {}) => {
+        if (!route) return;
+        try {
+            analyticsAdapter.page(route, props);
+        } catch {
+            // Fail-safe analytics: never break UI flow.
+        }
+    },
 };

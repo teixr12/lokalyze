@@ -68,14 +68,10 @@ test.describe(`Lokalyze smoke (${profile})`, () => {
 
         const deleteButtons = page.locator('button.hover\\:text-red-500');
         if (await deleteButtons.count()) {
-            let dialogSeen = false;
-            page.once('dialog', async dialog => {
-                dialogSeen = true;
-                await dialog.dismiss();
-            });
             await deleteButtons.first().click();
-            await page.waitForTimeout(300);
-            expect(dialogSeen).toBeTruthy();
+            await expect(page.getByRole('heading', { name: /delete project history/i })).toBeVisible();
+            await page.getByRole('button', { name: /keep project/i }).click();
+            await expect(page.getByRole('heading', { name: /delete project history/i })).toHaveCount(0);
         }
     });
 
